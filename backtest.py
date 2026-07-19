@@ -22,7 +22,7 @@ import joblib
 import numpy as np
 import torch
 
-from data_pipeline import fetch_ohlcv, OHLCV_COLUMNS
+from data_pipeline import fetch_ohlcv, add_indicators, FEATURE_COLUMNS, TARGET_COL_INDEX
 from model import TradeAILSTM
 import train  # hiperparametreler ve yeniden-eğitim fallback'i için
 
@@ -30,7 +30,7 @@ import train  # hiperparametreler ve yeniden-eğitim fallback'i için
 # ----------------------- Backtest parametreleri -----------------------
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "1h"
-LIMIT = 2000
+LIMIT = 5000  # ~7 ay (sayfalama ile derin veri) — genişletilmiş backtest
 
 MODEL_PATH = "trade_model.pth"
 SCALER_PATH = "scaler.pkl"
@@ -85,9 +85,10 @@ def generate_signals(model, scaler, df):
     signals : np.ndarray  -> her karar için +1 / -1 / 0
     """
     seq_len = train.SEQUENCE_LENGTH
-    target_idx = train.TARGET_COL_INDEX
+    target_idx = TARGET_COL_INDEX
 
-    values = df[OHLCV_COLUMNS].values
+    # 8 özellik: OHLCV + RSI + MACD + ATR
+    values = df[FEATURE_COLUMNS].values
     scaled = scaler.transform(values)
 
     # Tüm kayan pencereleri tek tensöre yığ (vektörel tahmin)
@@ -105,8 +106,8 @@ def generate_signals(model, scaler, df):
     with torch.no_grad():
         preds_scaled = model(X).cpu().numpy().reshape(-1)
 
-    # inverse_transform: 5 sütunlu dummy kurup sadece 'close'u geri çevir
-    dummy = np.zeros((len(preds_scaled), len(OHLCV_COLUMNS)))
+    # inverse_transform: 8 sütunlu dummy kurup sadece 'close'u geri çevir
+    dummy = np.zeros((len(preds_scaled), len(FEATURE_COLUMNS)))
     dummy[:, target_idx] = preds_scaled
     predicted_prices = scaler.inverse_transform(dummy)[:, target_idx]
 
@@ -215,10 +216,11 @@ if __name__ == "__main__":
     # 1) Model + scaler
     model, scaler = load_model_and_scaler()
 
-    # 2) Geçmiş 2000 mum
+    # 2) Geçmiş mumlar + indikatörler (8 özellik)
     print(f"\n[VERİ] {SYMBOL} son {LIMIT} mum çekiliyor ({TIMEFRAME})...")
     df = fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=LIMIT)
-    print(f"[VERİ] Ham veri şekli: {df.shape}")
+    df = add_indicators(df)  # RSI + MACD + ATR, NaN'ler temizlenir
+    print(f"[VERİ] İndikatörlü veri şekli: {df.shape}  ({FEATURE_COLUMNS})")
 
     # 3) Sinyaller
     print("[SİNYAL] Geçmiş mumlar için tahmin/sinyal üretiliyor...")

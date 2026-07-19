@@ -3,11 +3,12 @@ train.py — Eğitim Döngüsü (Training Loop)
 
 Görevi:
   1. data_pipeline.py ile Binance'ten GERÇEK BTC/USDT verisi çekmek,
-     ölçeklemek ve pencerelemek.
+     teknik indikatörleri eklemek (8 özellik), ölçeklemek ve pencerelemek.
   2. Zaman sırasını bozmadan (no shuffle) %80 Train / %20 Test bölmek
      ve DataLoader'lara sarmak.
-  3. TradeAILSTM modelini Adam + MSELoss ile 50 epoch eğitmek,
-     her 10 epoch'ta Train ve Test loss'u yazdırmak.
+  3. TradeAILSTM modelini Adam + MSELoss ile eğitmek.
+  4. Eğitim bitince modeli (trade_model.pth) ve scaler'ı (scaler.pkl)
+     MUTLAKA diske kaydetmek.
 
 NOT: Bu dosya SADECE eğitim yapar. Al-sat, backtest ve cüzdan
 işlemleri kapsam dışıdır. Tüm veri GERÇEK piyasa verisidir.
@@ -20,21 +21,27 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import MinMaxScaler
 
-from data_pipeline import fetch_ohlcv, create_sequences, OHLCV_COLUMNS
+from data_pipeline import (
+    fetch_ohlcv,
+    add_indicators,
+    create_sequences,
+    FEATURE_COLUMNS,
+    TARGET_COL_INDEX,
+)
 from model import TradeAILSTM
 
 
 # ----------------------- Hiperparametreler -----------------------
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "1h"
-LIMIT = 1000
+LIMIT = 5000  # ~7 ay (sayfalama ile derin veri) — daha geniş piyasa döngüsü
 SEQUENCE_LENGTH = 60
-TARGET_COL_INDEX = OHLCV_COLUMNS.index("close")  # 'close' = 3
 
 TRAIN_RATIO = 0.8
 BATCH_SIZE = 32
 
-INPUT_SIZE = len(OHLCV_COLUMNS)  # 5 (OHLCV)
+# Özellik sayısı artık dinamik: 8 (OHLCV + RSI + MACD + ATR)
+INPUT_SIZE = len(FEATURE_COLUMNS)
 HIDDEN_SIZE = 64
 NUM_LAYERS = 2
 OUTPUT_SIZE = 1
@@ -42,7 +49,7 @@ OUTPUT_SIZE = 1
 LEARNING_RATE = 0.001
 EPOCHS = 50
 
-# Kaydedilecek artefaktların dosya yolları (inference.py bunları yükler)
+# Kaydedilecek artefaktlar (inference.py / backtest.py bunları yükler)
 MODEL_PATH = "trade_model.pth"
 SCALER_PATH = "scaler.pkl"
 
@@ -51,18 +58,19 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def prepare_data():
     """
-    Gerçek veriyi çeker, zaman-serisi güvenli şekilde bölerek ölçekler,
-    pencereler ve Train/Test DataLoader'larını döndürür.
+    Gerçek veriyi çeker, indikatör ekler, zaman-serisi güvenli şekilde
+    bölerek ölçekler, pencereler ve Train/Test DataLoader'larını döndürür.
 
     Data leakage'i önlemek için MinMaxScaler yalnızca eğitim (train)
     dilimindeki ham veri üzerine fit edilir; test dilimi aynı scaler
     ile sadece transform edilir.
     """
-    # 1) Gerçek OHLCV verisini çek
+    # 1) Gerçek OHLCV verisini çek + indikatör ekle (8 özellik)
     print(f"[VERİ] {SYMBOL} çekiliyor ({TIMEFRAME}, limit={LIMIT})...")
     df = fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=LIMIT)
-    values = df[OHLCV_COLUMNS].values
-    print(f"[VERİ] Ham veri şekli: {values.shape}")
+    df = add_indicators(df)
+    values = df[FEATURE_COLUMNS].values
+    print(f"[VERİ] İndikatörlü veri şekli: {values.shape}  ({FEATURE_COLUMNS})")
 
     # 2) Ham veriyi zaman sırasına göre böl (KARIŞTIRMA YOK)
     split_idx = int(len(values) * TRAIN_RATIO)
@@ -75,9 +83,8 @@ def prepare_data():
     train_scaled = scaler.transform(train_raw)
     test_scaled = scaler.transform(test_raw)
 
-    # 4) Test dilimi için ilk pencerenin geçmişe ihtiyacı var; bu yüzden
-    #    train'in son SEQUENCE_LENGTH mumunu test'in başına ekliyoruz.
-    #    Böylece test sekansları kesintisiz ve leakage'siz üretilir.
+    # 4) Test sekanslarının kesintisiz üretilmesi için train'in son
+    #    SEQUENCE_LENGTH mumunu test'in başına ekle (leakage'siz).
     test_scaled_ext = np.concatenate(
         [train_scaled[-SEQUENCE_LENGTH:], test_scaled], axis=0
     )
@@ -139,7 +146,7 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
 
-    print(f"\n[EĞİTİM] Cihaz: {DEVICE} | Epoch: {EPOCHS} | Batch: {BATCH_SIZE}")
+    print(f"\n[EĞİTİM] Cihaz: {DEVICE} | Özellik: {INPUT_SIZE} | Epoch: {EPOCHS}")
     print("-" * 55)
 
     # ---- Eğitim döngüsü ----
@@ -152,11 +159,11 @@ def train():
             X_batch = X_batch.to(DEVICE)
             y_batch = y_batch.to(DEVICE)
 
-            optimizer.zero_grad()          # gradyanları sıfırla
-            preds = model(X_batch)         # ileri geçiş (forward)
+            optimizer.zero_grad()             # gradyanları sıfırla
+            preds = model(X_batch)            # ileri geçiş (forward)
             loss = criterion(preds, y_batch)  # hatayı hesapla (MSE)
-            loss.backward()                # geriye yayılım (backward)
-            optimizer.step()               # ağırlıkları güncelle
+            loss.backward()                   # geriye yayılım (backward)
+            optimizer.step()                  # ağırlıkları güncelle
 
             running_loss += loss.item() * X_batch.size(0)
             running_samples += X_batch.size(0)
@@ -173,7 +180,7 @@ def train():
     print("-" * 55)
     print("[EĞİTİM] Tamamlandı.")
 
-    # ---- Model ağırlıklarını ve scaler'ı diske kaydet ----
+    # ---- MİMARİ ONARIM: model ağırlıklarını ve scaler'ı MUTLAKA kaydet ----
     torch.save(model.state_dict(), MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
     print(f"[KAYIT] Model  -> {MODEL_PATH}")
