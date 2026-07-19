@@ -25,8 +25,9 @@ from model import TradeAILSTM
 import train  # hiperparametreler (INPUT_SIZE, SEQUENCE_LENGTH, yollar) için
 
 
-# Sinyal eşiği: tahmin, mevcut fiyattan bu oranın üstünde/altında ise işlem sinyali
-THRESHOLD = 0.002  # %0.2
+# Dinamik volatilite eşiği: sabit oran yerine ATR bazlı bant kullanılır.
+# Eşik = ATR * ATR_MULTIPLIER  (piyasa oynaklığına göre otomatik genişler/daralır)
+ATR_MULTIPLIER = 0.5
 
 # İndikatör ısınması için ekstra mum tamponu (RSI/MACD/ATR warm-up)
 WARMUP_BUFFER = 100
@@ -74,6 +75,7 @@ def fetch_latest_window(symbol="BTC/USDT", timeframe="1h", sequence_length=None)
     -----
     window_raw : numpy.ndarray, şekil (sequence_length, 8)
     last_close : float  (en son mumun gerçek kapanış fiyatı, USDT)
+    last_atr   : float  (en son mumun ATR değeri -> dinamik eşik için)
     """
     if sequence_length is None:
         sequence_length = train.SEQUENCE_LENGTH
@@ -92,7 +94,8 @@ def fetch_latest_window(symbol="BTC/USDT", timeframe="1h", sequence_length=None)
     window_df = df.iloc[-sequence_length:]
     window_raw = window_df[FEATURE_COLUMNS].values
     last_close = float(window_df["close"].iloc[-1])
-    return window_raw, last_close
+    last_atr = float(window_df["atr"].iloc[-1])
+    return window_raw, last_close, last_atr
 
 
 def predict_price(model, scaler, window_raw):
@@ -118,24 +121,32 @@ def predict_price(model, scaler, window_raw):
     return predicted_price
 
 
-def generate_signal(current_price, predicted_price, threshold=THRESHOLD):
+def generate_signal(current_price, predicted_price, current_atr, atr_multiplier=ATR_MULTIPLIER):
     """
-    Eşik (threshold) mantığıyla sinyal üretir.
+    Dinamik volatilite (ATR bazlı) eşik mantığıyla sinyal üretir.
+
+    Sabit oran yerine, o anki mumun ATR'sine göre bir bant kurulur:
+        band  = ATR * atr_multiplier
+        upper = current_price + band
+        lower = current_price - band
+    Tahmin bandın dışına çıkarsa işlem sinyali üretilir.
 
     Dönüş
     -----
-    signal : int   ( 1 = AL, -1 = SAT, 0 = BEKLE )
+    signal : int    ( 1 = AL, -1 = SAT, 0 = BEKLE )
     label  : str
-    change : float (oransal değişim)
+    band   : float  (uygulanan eşik bandı, USDT)
     """
-    change = (predicted_price - current_price) / current_price
+    band = current_atr * atr_multiplier
+    upper_threshold = current_price + band
+    lower_threshold = current_price - band
 
-    if change > threshold:
-        return 1, "AL", change
-    elif change < -threshold:
-        return -1, "SAT", change
+    if predicted_price > upper_threshold:
+        return 1, "AL", band
+    elif predicted_price < lower_threshold:
+        return -1, "SAT", band
     else:
-        return 0, "BEKLE", change
+        return 0, "BEKLE", band
 
 
 if __name__ == "__main__":
@@ -145,19 +156,22 @@ if __name__ == "__main__":
     # 1) Diskten model + scaler
     model, scaler = load_model_and_scaler()
 
-    # 2) Anlık son 60 mum (indikatörlü, 8 özellik)
+    # 2) Anlık son 60 mum (indikatörlü, 8 özellik) + ATR
     print(f"\n[VERİ] {SYMBOL} anlık veri çekiliyor ({TIMEFRAME})...")
-    window_raw, current_price = fetch_latest_window(symbol=SYMBOL, timeframe=TIMEFRAME)
+    window_raw, current_price, current_atr = fetch_latest_window(
+        symbol=SYMBOL, timeframe=TIMEFRAME
+    )
 
-    # 3) Tahmin + sinyal
+    # 3) Tahmin + dinamik (ATR bazlı) sinyal
     predicted_price = predict_price(model, scaler, window_raw)
-    signal, label, change = generate_signal(current_price, predicted_price)
+    signal, label, band = generate_signal(current_price, predicted_price, current_atr)
 
     # ----------------------- Sonuç -----------------------
-    print("\n" + "=" * 45)
-    print(f"  Sembol              : {SYMBOL} ({TIMEFRAME})")
-    print(f"  Şu anki Fiyat       : {current_price:,.2f} USDT")
-    print(f"  Tahmin Edilen Fiyat : {predicted_price:,.2f} USDT")
-    print(f"  Beklenen Değişim    : {change * 100:+.3f} %  (eşik: ±{THRESHOLD * 100:.1f}%)")
-    print(f"  Üretilen Sinyal     : {label} ({signal})")
-    print("=" * 45)
+    print("\n" + "=" * 48)
+    print(f"  Sembol               : {SYMBOL} ({TIMEFRAME})")
+    print(f"  Şu anki Fiyat        : {current_price:,.2f} USDT")
+    print(f"  Tahmin Edilen Fiyat  : {predicted_price:,.2f} USDT")
+    print(f"  ATR                  : {current_atr:,.2f} USDT")
+    print(f"  Dinamik Eşik (±band) : ±{band:,.2f} USDT  (ATR x {ATR_MULTIPLIER})")
+    print(f"  Üretilen Sinyal      : {label} ({signal})")
+    print("=" * 48)

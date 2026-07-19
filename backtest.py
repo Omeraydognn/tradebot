@@ -38,7 +38,10 @@ SCALER_PATH = "scaler.pkl"
 INITIAL_BALANCE = 10_000.0   # USDT
 COMMISSION = 0.001           # işlem başına %0.1 (Binance taker)
 STOP_LOSS = 0.02             # %2 sabit stop-loss (long)
-THRESHOLD = 0.002            # %0.2 sinyal eşiği (inference ile aynı)
+
+# Dinamik volatilite eşiği: sabit oran yerine ATR bazlı bant kullanılır.
+# Eşik = ATR * ATR_MULTIPLIER  (piyasa oynaklığına göre otomatik genişler/daralır)
+ATR_MULTIPLIER = 0.5
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,7 +80,8 @@ def generate_signals(model, scaler, df):
     Her karar noktasında:
       - Girdi  : son `seq_len` mum (ölçekli)  -> modelin close tahmini
       - Mevcut : penceredeki son mumun gerçek kapanışı (bilinen fiyat)
-      - Sinyal : (tahmin - mevcut) / mevcut  eşikle karşılaştırılır
+      - Eşik   : o anki mumun ATR'si * ATR_MULTIPLIER (dinamik volatilite bandı)
+      - Sinyal : tahmin, [mevcut ± eşik] bandının dışına çıkarsa üretilir
 
     Dönüş
     -----
@@ -86,6 +90,7 @@ def generate_signals(model, scaler, df):
     """
     seq_len = train.SEQUENCE_LENGTH
     target_idx = TARGET_COL_INDEX
+    atr_idx = FEATURE_COLUMNS.index("atr")
 
     # 8 özellik: OHLCV + RSI + MACD + ATR
     values = df[FEATURE_COLUMNS].values
@@ -94,13 +99,16 @@ def generate_signals(model, scaler, df):
     # Tüm kayan pencereleri tek tensöre yığ (vektörel tahmin)
     windows = []
     current_prices = []
+    current_atrs = []
     for i in range(seq_len, len(scaled)):
         windows.append(scaled[i - seq_len:i, :])
-        # Karar anında bilinen fiyat: penceredeki son mumun gerçek kapanışı
+        # Karar anında bilinen (ham) fiyat ve ATR: penceredeki son mum
         current_prices.append(values[i - 1, target_idx])
+        current_atrs.append(values[i - 1, atr_idx])
 
     X = torch.tensor(np.array(windows), dtype=torch.float32).to(DEVICE)
     current_prices = np.array(current_prices)
+    current_atrs = np.array(current_atrs)
 
     # Batch tahmin (0-1 ölçekli close)
     with torch.no_grad():
@@ -111,9 +119,16 @@ def generate_signals(model, scaler, df):
     dummy[:, target_idx] = preds_scaled
     predicted_prices = scaler.inverse_transform(dummy)[:, target_idx]
 
-    # Eşik mantığı ile sinyal üret
-    change = (predicted_prices - current_prices) / current_prices
-    signals = np.where(change > THRESHOLD, 1, np.where(change < -THRESHOLD, -1, 0))
+    # --- DİNAMİK VOLATİLİTE EŞİĞİ (ATR bazlı) ---
+    # Sabit oran yerine, her mumun ATR'sine göre değişen bir bant kurulur.
+    band = current_atrs * ATR_MULTIPLIER
+    upper_threshold = current_prices + band
+    lower_threshold = current_prices - band
+
+    signals = np.where(
+        predicted_prices > upper_threshold, 1,
+        np.where(predicted_prices < lower_threshold, -1, 0),
+    )
 
     return current_prices, signals
 
