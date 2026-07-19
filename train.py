@@ -128,22 +128,28 @@ def prepare_data():
 
 def compute_class_weights(y, num_classes=3):
     """
-    Ters frekans (inverse frequency) mantığıyla dinamik sınıf ağırlıkları üretir.
+    Ters frekans (inverse frequency) mantığıyla dinamik sınıf ağırlıkları üretir
+    ve KAREKÖK ile YUMUŞATIR.
 
-        weight_c = toplam_örnek / (sınıf_sayısı * count_c)
+        ham_weight_c = toplam_örnek / (sınıf_sayısı * count_c)
+        weight_c     = sqrt(ham_weight_c)
 
-    Böylece sık görülen sınıf (ör. 1=BEKLE) DÜŞÜK, nadir sınıflar (0=SAT, 2=AL)
-    YÜKSEK ağırlık alır. Hiç görülmeyen sınıf için 0'a bölmeyi önlemek üzere
-    count 1'e sabitlenir.
+    Ham ters frekans, BEKLE gibi baskın sınıfa çok düşük, nadir SAT/AL'ye çok
+    yüksek ağırlık vererek modeli aşırı işlem (overtrading) yapmaya itiyordu.
+    Karekök, uçlardaki bu farkı makul bir seviyeye çekerek hiperaktiviteyi
+    dizginler (yüksek ağırlıklar küçülür, oranlar korunur).
+
+    Hiç görülmeyen sınıf için 0'a bölmeyi önlemek üzere count 1'e sabitlenir.
 
     Dönüş
     -----
-    numpy.ndarray, şekil (num_classes,)  -> float32 ağırlıklar
+    numpy.ndarray, şekil (num_classes,)  -> float32 (yumuşatılmış) ağırlıklar
     """
     y = np.asarray(y).reshape(-1).astype(int)
     counts = np.bincount(y, minlength=num_classes).astype(np.float64)
     counts[counts == 0] = 1.0  # 0'a bölme koruması
-    weights = counts.sum() / (num_classes * counts)
+    raw_weights = counts.sum() / (num_classes * counts)
+    weights = np.sqrt(raw_weights)  # AĞIRLIK YUMUŞATMA (uçları dizginle)
     return weights.astype(np.float32)
 
 

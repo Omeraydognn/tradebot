@@ -42,8 +42,13 @@ SCALER_PATH = "scaler.pkl"
 
 INITIAL_BALANCE = 10_000.0   # USDT
 COMMISSION = 0.001           # işlem başına %0.1 (Binance taker)
-STOP_LOSS = 0.02             # %2 sabit stop-loss (long)
-TAKE_PROFIT = 0.03           # %3 sabit take-profit (long)
+
+# Dinamik (ATR bazlı) risk yönetimi — sabit yüzde yerine volatiliteye uyar.
+# Girişteki ATR (entry_atr) baz alınır:
+#   Stop-Loss   = entry_price - (entry_atr * ATR_SL_MULT)
+#   Take-Profit = entry_price + (entry_atr * ATR_TP_MULT)
+ATR_SL_MULT = 1.5
+ATR_TP_MULT = 2.0
 
 # NOT: Eşik (threshold) mantığı artık burada YOK; yön kararı doğrudan modelin
 # sınıf tahmininden (0=SAT, 1=BEKLE, 2=AL) gelir. Etiketleme eşiği eğitim
@@ -94,9 +99,11 @@ def generate_signals(model, scaler, df):
     Dönüş
     -----
     prices  : np.ndarray  -> karar anındaki mevcut kapanış fiyatları (USDT)
+    atrs    : np.ndarray  -> karar anındaki ATR değerleri (dinamik SL/TP için)
     signals : np.ndarray  -> her karar için +1 / -1 / 0
     """
     seq_len = train.SEQUENCE_LENGTH
+    atr_idx = FEATURE_COLUMNS.index("atr")
 
     # 9 özellik: OHLCV + RSI + MACD + ATR + Returns
     values = df[FEATURE_COLUMNS].values
@@ -105,13 +112,16 @@ def generate_signals(model, scaler, df):
     # Tüm kayan pencereleri tek tensöre yığ (vektörel tahmin)
     windows = []
     current_prices = []
+    current_atrs = []
     for i in range(seq_len, len(scaled)):
         windows.append(scaled[i - seq_len:i, :])
-        # Karar anında bilinen (ham) fiyat: penceredeki son mumun kapanışı
+        # Karar anında bilinen (ham) fiyat ve ATR: penceredeki son mum
         current_prices.append(values[i - 1, CLOSE_COL_INDEX])
+        current_atrs.append(values[i - 1, atr_idx])
 
     X = torch.tensor(np.array(windows), dtype=torch.float32).to(DEVICE)
     current_prices = np.array(current_prices)
+    current_atrs = np.array(current_atrs)
 
     # Batch tahmin: 3 sınıf logits -> argmax -> sınıf (0/1/2)
     with torch.no_grad():
@@ -121,19 +131,22 @@ def generate_signals(model, scaler, df):
     # Sınıfı sinyale çevir: 2(AL)->+1, 1(BEKLE)->0, 0(SAT)->-1  (sınıf - 1)
     signals = predicted_classes - 1
 
-    return current_prices, signals
+    return current_prices, current_atrs, signals
 
 
-def run_backtest(prices, signals):
+def run_backtest(prices, atrs, signals):
     """
-    Long-only portföy simülasyonu (komisyon + stop-loss + take-profit dahil).
+    Long-only portföy simülasyonu (komisyon + DİNAMİK ATR bazlı SL/TP dahil).
 
     Kurallar
     --------
-    - AL (+1) ve pozisyon yokken  -> tüm bakiyeyle long aç.
+    - AL (+1) ve pozisyon yokken  -> tüm bakiyeyle long aç; girişteki ATR
+      (entry_atr) kaydedilerek dinamik seviyeler hesaplanır:
+          stop_price = entry_price - (entry_atr * ATR_SL_MULT)
+          take_price = entry_price + (entry_atr * ATR_TP_MULT)
     - SAT (-1) ve pozisyondayken  -> pozisyonu kapat.
-    - Stop-Loss  : fiyat giriş * (1 - STOP_LOSS) altına düşerse zararına kapat.
-    - Take-Profit: fiyat giriş * (1 + TAKE_PROFIT) üstüne çıkarsa kârla kapat.
+    - Stop-Loss  : fiyat stop_price'a (veya altına) inerse zararına kapat.
+    - Take-Profit: fiyat take_price'a (veya üstüne) çıkarsa kârla kapat.
     - Her alım ve satımda COMMISSION uygulanır.
 
     Not: Short (açığa satış) altyapısı olmadığından SL/TP yalnızca Long
@@ -146,6 +159,8 @@ def run_backtest(prices, signals):
     balance = INITIAL_BALANCE   # eldeki nakit (USDT)
     position_qty = 0.0          # elde tutulan BTC miktarı
     entry_price = 0.0
+    stop_price = 0.0            # girişte hesaplanan dinamik SL seviyesi
+    take_price = 0.0           # girişte hesaplanan dinamik TP seviyesi
     in_position = False
 
     total_trades = 0            # tamamlanan işlem (round-trip) sayısı
@@ -153,15 +168,15 @@ def run_backtest(prices, signals):
     take_profit_hits = 0
     equity_curve = []
 
-    for price, signal in zip(prices, signals):
-        # --- 1) Risk yönetimi: Stop-Loss / Take-Profit (pozisyondayken) ---
-        if in_position and price <= entry_price * (1 - STOP_LOSS):
+    for price, atr, signal in zip(prices, atrs, signals):
+        # --- 1) Risk yönetimi: DİNAMİK Stop-Loss / Take-Profit ---
+        if in_position and price <= stop_price:
             balance = position_qty * price * (1 - COMMISSION)  # zararına kapat
             in_position = False
             position_qty = 0.0
             total_trades += 1
             stop_loss_hits += 1
-        elif in_position and price >= entry_price * (1 + TAKE_PROFIT):
+        elif in_position and price >= take_price:
             balance = position_qty * price * (1 - COMMISSION)  # kârla kapat
             in_position = False
             position_qty = 0.0
@@ -173,6 +188,9 @@ def run_backtest(prices, signals):
             # Long aç: nakit -> BTC (komisyon düşülür)
             position_qty = (balance * (1 - COMMISSION)) / price
             entry_price = price
+            # Girişteki ATR'ye göre dinamik SL/TP seviyelerini sabitle
+            stop_price = entry_price - (atr * ATR_SL_MULT)
+            take_price = entry_price + (atr * ATR_TP_MULT)
             balance = 0.0
             in_position = True
         elif signal == -1 and in_position:
@@ -241,14 +259,14 @@ if __name__ == "__main__":
     df = add_indicators(df)  # RSI + MACD + ATR, NaN'ler temizlenir
     print(f"[VERİ] İndikatörlü veri şekli: {df.shape}  ({FEATURE_COLUMNS})")
 
-    # 3) Sinyaller
+    # 3) Sinyaller (+ dinamik SL/TP için ATR)
     print("[SİNYAL] Geçmiş mumlar için tahmin/sinyal üretiliyor...")
-    prices, signals = generate_signals(model, scaler, df)
+    prices, atrs, signals = generate_signals(model, scaler, df)
     n_buy = int((signals == 1).sum())
     n_sell = int((signals == -1).sum())
     n_hold = int((signals == 0).sum())
     print(f"[SİNYAL] AL: {n_buy} | SAT: {n_sell} | BEKLE: {n_hold}")
 
     # 4) Simülasyon + rapor
-    result = run_backtest(prices, signals)
+    result = run_backtest(prices, atrs, signals)
     print_report(result)
