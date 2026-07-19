@@ -31,8 +31,8 @@ MAX_CANDLES_PER_REQUEST = 1000
 # Ham OHLCV sütunları
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 
-# Teknik indikatör sütunları
-INDICATOR_COLUMNS = ["rsi", "macd", "atr"]
+# Teknik indikatör sütunları (ema_200 = uzun vadeli trend filtresi)
+INDICATOR_COLUMNS = ["rsi", "macd", "atr", "ema_200"]
 
 # Yüzdelik getiri sütunu (durağan; hem girdi özelliği hem de etiketin kaynağı)
 RETURNS_COLUMN = "returns"
@@ -114,6 +114,7 @@ def add_indicators(df):
       - rsi          : RSI(14)   -> aşırı alım/satım
       - macd         : MACD(12, 26)  -> trend momentumu (MACD çizgisi)
       - atr          : ATR(14)   -> volatilite
+      - ema_200      : EMA(200)  -> uzun vadeli trend yönü (trend filtresi)
       - returns      : close.pct_change()  -> DURAĞAN yüzdelik getiri (girdi + etiket kaynağı)
       - target_class : 0 (SAT) / 1 (BEKLE) / 2 (AL)  -> SINIFLANDIRMA hedefi
 
@@ -140,6 +141,9 @@ def add_indicators(df):
     df["atr"] = ta.volatility.AverageTrueRange(
         high=df["high"], low=df["low"], close=df["close"], window=14
     ).average_true_range()
+
+    # EMA (200) -> uzun vadeli trend yönü (fiyat > ema_200 ise yukarı trend)
+    df["ema_200"] = ta.trend.EMAIndicator(close=df["close"], window=200).ema_indicator()
 
     # Yüzdelik getiri: bir önceki muma göre % değişim (durağan seri)
     df["returns"] = df["close"].pct_change()

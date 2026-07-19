@@ -50,6 +50,10 @@ COMMISSION = 0.001           # işlem başına %0.1 (Binance taker)
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 2.0
 
+# Güven eşiği: AL/SAT sinyali ancak sınıf olasılığı bu değerin üstündeyse
+# geçerli sayılır; altındaysa sinyal BEKLE'ye zorlanır (düşük güvenli işlem yok).
+CONFIDENCE_THRESHOLD = 0.65
+
 # NOT: Eşik (threshold) mantığı artık burada YOK; yön kararı doğrudan modelin
 # sınıf tahmininden (0=SAT, 1=BEKLE, 2=AL) gelir. Etiketleme eşiği eğitim
 # verisine (data_pipeline.add_indicators) gömülüdür.
@@ -88,24 +92,28 @@ def generate_signals(model, scaler, df):
     """
     Geçmiş verinin her mumu için sinyal üretir (vektörel/batch tahmin).
 
-    Model 3 sınıflı logits döndürür; argmax ile en yüksek olasılıklı sınıf
-    seçilir ve işlem sinyaline çevrilir. Eşik (threshold) hesabı YOKTUR.
+    Model 3 sınıflı logits döndürür. Logits softmax ile olasılığa çevrilir,
+    argmax ile sınıf seçilir; ancak GÜVEN EŞİĞİ altındaki AL/SAT sinyalleri
+    BEKLE'ye zorlanır (düşük güvenli işlem yok).
 
     Her karar noktasında:
       - Girdi  : son `seq_len` mumun ölçekli özellikleri  -> 3 sınıf logits
-      - Sınıf  : argmax(logits) -> 0 (SAT) / 1 (BEKLE) / 2 (AL)
+      - Olasılık: softmax(logits)
+      - Sınıf  : argmax; AL/SAT ise ve olasılık < CONFIDENCE_THRESHOLD -> 1 (BEKLE)
       - Sinyal : signal = sınıf - 1  -> -1 / 0 / +1
 
     Dönüş
     -----
-    prices  : np.ndarray  -> karar anındaki mevcut kapanış fiyatları (USDT)
-    atrs    : np.ndarray  -> karar anındaki ATR değerleri (dinamik SL/TP için)
-    signals : np.ndarray  -> her karar için +1 / -1 / 0
+    prices   : np.ndarray -> karar anındaki mevcut kapanış fiyatları (USDT)
+    atrs     : np.ndarray -> karar anındaki ATR değerleri (dinamik SL/TP için)
+    ema_200s : np.ndarray -> karar anındaki EMA-200 değerleri (trend filtresi için)
+    signals  : np.ndarray -> her karar için +1 / -1 / 0
     """
     seq_len = train.SEQUENCE_LENGTH
     atr_idx = FEATURE_COLUMNS.index("atr")
+    ema_idx = FEATURE_COLUMNS.index("ema_200")
 
-    # 9 özellik: OHLCV + RSI + MACD + ATR + Returns
+    # 11 özellik: OHLCV + RSI + MACD + ATR + EMA200 + Returns
     values = df[FEATURE_COLUMNS].values
     scaled = scaler.transform(values)
 
@@ -113,37 +121,52 @@ def generate_signals(model, scaler, df):
     windows = []
     current_prices = []
     current_atrs = []
+    current_emas = []
     for i in range(seq_len, len(scaled)):
         windows.append(scaled[i - seq_len:i, :])
-        # Karar anında bilinen (ham) fiyat ve ATR: penceredeki son mum
+        # Karar anında bilinen (ham) fiyat, ATR ve EMA-200: penceredeki son mum
         current_prices.append(values[i - 1, CLOSE_COL_INDEX])
         current_atrs.append(values[i - 1, atr_idx])
+        current_emas.append(values[i - 1, ema_idx])
 
     X = torch.tensor(np.array(windows), dtype=torch.float32).to(DEVICE)
     current_prices = np.array(current_prices)
     current_atrs = np.array(current_atrs)
+    current_emas = np.array(current_emas)
 
-    # Batch tahmin: 3 sınıf logits -> argmax -> sınıf (0/1/2)
+    # Batch tahmin: logits -> softmax olasılıkları -> argmax sınıf
     with torch.no_grad():
         logits = model(X)                                   # (N, 3)
-        predicted_classes = torch.argmax(logits, dim=1).cpu().numpy()
+        probs = torch.softmax(logits, dim=1).cpu().numpy()  # (N, 3)
+        predicted_classes = probs.argmax(axis=1)            # (N,)
+
+    # --- GÜVEN EŞİĞİ ---
+    # Seçilen sınıfın olasılığı; AL(2)/SAT(0) ise ve eşiğin altındaysa BEKLE(1) yap.
+    chosen_conf = probs[np.arange(len(probs)), predicted_classes]
+    low_conf_trade = (chosen_conf < CONFIDENCE_THRESHOLD) & (
+        (predicted_classes == 2) | (predicted_classes == 0)
+    )
+    predicted_classes[low_conf_trade] = 1  # düşük güvenli AL/SAT -> BEKLE
 
     # Sınıfı sinyale çevir: 2(AL)->+1, 1(BEKLE)->0, 0(SAT)->-1  (sınıf - 1)
     signals = predicted_classes - 1
 
-    return current_prices, current_atrs, signals
+    return current_prices, current_atrs, current_emas, signals
 
 
-def run_backtest(prices, atrs, signals):
+def run_backtest(prices, atrs, ema_200s, signals):
     """
-    Long-only portföy simülasyonu (komisyon + DİNAMİK ATR bazlı SL/TP dahil).
+    Long-only portföy simülasyonu (komisyon + DİNAMİK ATR bazlı SL/TP +
+    EMA-200 trend filtresi dahil).
 
     Kurallar
     --------
-    - AL (+1) ve pozisyon yokken  -> tüm bakiyeyle long aç; girişteki ATR
-      (entry_atr) kaydedilerek dinamik seviyeler hesaplanır:
+    - AL (+1), pozisyon yok VE fiyat > EMA-200 (yukarı trend)  -> long aç.
+      Girişteki ATR (entry_atr) ile dinamik seviyeler hesaplanır:
           stop_price = entry_price - (entry_atr * ATR_SL_MULT)
           take_price = entry_price + (entry_atr * ATR_TP_MULT)
+    - Trend Filtresi: AL sinyali gelse bile fiyat EMA-200'ün ALTINDAysa
+      işlem REDDEDİLİR (aşağı trendde long açma).
     - SAT (-1) ve pozisyondayken  -> pozisyonu kapat.
     - Stop-Loss  : fiyat stop_price'a (veya altına) inerse zararına kapat.
     - Take-Profit: fiyat take_price'a (veya üstüne) çıkarsa kârla kapat.
@@ -166,9 +189,10 @@ def run_backtest(prices, atrs, signals):
     total_trades = 0            # tamamlanan işlem (round-trip) sayısı
     stop_loss_hits = 0
     take_profit_hits = 0
+    trend_rejects = 0          # EMA filtresiyle reddedilen AL sinyalleri
     equity_curve = []
 
-    for price, atr, signal in zip(prices, atrs, signals):
+    for price, atr, ema, signal in zip(prices, atrs, ema_200s, signals):
         # --- 1) Risk yönetimi: DİNAMİK Stop-Loss / Take-Profit ---
         if in_position and price <= stop_price:
             balance = position_qty * price * (1 - COMMISSION)  # zararına kapat
@@ -185,14 +209,18 @@ def run_backtest(prices, atrs, signals):
 
         # --- 2) Sinyale göre aksiyon ---
         if signal == 1 and not in_position:
-            # Long aç: nakit -> BTC (komisyon düşülür)
-            position_qty = (balance * (1 - COMMISSION)) / price
-            entry_price = price
-            # Girişteki ATR'ye göre dinamik SL/TP seviyelerini sabitle
-            stop_price = entry_price - (atr * ATR_SL_MULT)
-            take_price = entry_price + (atr * ATR_TP_MULT)
-            balance = 0.0
-            in_position = True
+            # TREND FİLTRESİ: yalnızca fiyat EMA-200 üstündeyse (yukarı trend) al
+            if price > ema:
+                # Long aç: nakit -> BTC (komisyon düşülür)
+                position_qty = (balance * (1 - COMMISSION)) / price
+                entry_price = price
+                # Girişteki ATR'ye göre dinamik SL/TP seviyelerini sabitle
+                stop_price = entry_price - (atr * ATR_SL_MULT)
+                take_price = entry_price + (atr * ATR_TP_MULT)
+                balance = 0.0
+                in_position = True
+            else:
+                trend_rejects += 1  # aşağı trend -> AL reddedildi
         elif signal == -1 and in_position:
             # Pozisyonu kapat: BTC -> nakit (komisyon düşülür)
             balance = position_qty * price * (1 - COMMISSION)
@@ -228,6 +256,7 @@ def run_backtest(prices, atrs, signals):
         "total_trades": total_trades,
         "stop_loss_hits": stop_loss_hits,
         "take_profit_hits": take_profit_hits,
+        "trend_rejects": trend_rejects,
         "max_drawdown_pct": max_drawdown * 100,
     }
 
@@ -245,6 +274,7 @@ def print_report(result):
     print(f"  Toplam İşlem Sayısı  : {result['total_trades']:>14d}")
     print(f"  Stop-Loss Tetiklenme : {result['stop_loss_hits']:>14d}")
     print(f"  Take-Profit Tetikl.  : {result['take_profit_hits']:>14d}")
+    print(f"  Trend Filtre Reddi   : {result['trend_rejects']:>14d}")
     print(f"  Max Drawdown (MDD)   : {result['max_drawdown_pct']:>13,.2f} %")
     print(line)
 
@@ -253,20 +283,21 @@ if __name__ == "__main__":
     # 1) Model + scaler
     model, scaler = load_model_and_scaler()
 
-    # 2) Geçmiş mumlar + indikatörler (8 özellik)
+    # 2) Geçmiş mumlar + indikatörler (RSI, MACD, ATR, EMA-200, returns)
     print(f"\n[VERİ] {SYMBOL} son {LIMIT} mum çekiliyor ({TIMEFRAME})...")
     df = fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=LIMIT)
-    df = add_indicators(df)  # RSI + MACD + ATR, NaN'ler temizlenir
+    df = add_indicators(df)  # indikatörler + returns, NaN'ler temizlenir
     print(f"[VERİ] İndikatörlü veri şekli: {df.shape}  ({FEATURE_COLUMNS})")
 
-    # 3) Sinyaller (+ dinamik SL/TP için ATR)
+    # 3) Sinyaller (+ dinamik SL/TP için ATR, trend filtresi için EMA-200)
     print("[SİNYAL] Geçmiş mumlar için tahmin/sinyal üretiliyor...")
-    prices, atrs, signals = generate_signals(model, scaler, df)
+    prices, atrs, ema_200s, signals = generate_signals(model, scaler, df)
     n_buy = int((signals == 1).sum())
     n_sell = int((signals == -1).sum())
     n_hold = int((signals == 0).sum())
-    print(f"[SİNYAL] AL: {n_buy} | SAT: {n_sell} | BEKLE: {n_hold}")
+    print(f"[SİNYAL] AL: {n_buy} | SAT: {n_sell} | BEKLE: {n_hold}  "
+          f"(güven eşiği: %{CONFIDENCE_THRESHOLD*100:.0f})")
 
     # 4) Simülasyon + rapor
-    result = run_backtest(prices, atrs, signals)
+    result = run_backtest(prices, atrs, ema_200s, signals)
     print_report(result)
