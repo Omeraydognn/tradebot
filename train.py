@@ -13,6 +13,7 @@ NOT: Bu dosya SADECE eğitim yapar. Al-sat, backtest ve cüzdan
 işlemleri kapsam dışıdır. Tüm veri GERÇEK piyasa verisidir.
 """
 
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -40,6 +41,10 @@ OUTPUT_SIZE = 1
 
 LEARNING_RATE = 0.001
 EPOCHS = 50
+
+# Kaydedilecek artefaktların dosya yolları (inference.py bunları yükler)
+MODEL_PATH = "trade_model.pth"
+SCALER_PATH = "scaler.pkl"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -167,6 +172,13 @@ def train():
 
     print("-" * 55)
     print("[EĞİTİM] Tamamlandı.")
+
+    # ---- Model ağırlıklarını ve scaler'ı diske kaydet ----
+    torch.save(model.state_dict(), MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    print(f"[KAYIT] Model  -> {MODEL_PATH}")
+    print(f"[KAYIT] Scaler -> {SCALER_PATH}")
+
     return model, scaler
 
 
