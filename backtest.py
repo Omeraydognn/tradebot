@@ -43,6 +43,7 @@ SCALER_PATH = "scaler.pkl"
 INITIAL_BALANCE = 10_000.0   # USDT
 COMMISSION = 0.001           # işlem başına %0.1 (Binance taker)
 STOP_LOSS = 0.02             # %2 sabit stop-loss (long)
+TAKE_PROFIT = 0.03           # %3 sabit take-profit (long)
 
 # NOT: Eşik (threshold) mantığı artık burada YOK; yön kararı doğrudan modelin
 # sınıf tahmininden (0=SAT, 1=BEKLE, 2=AL) gelir. Etiketleme eşiği eğitim
@@ -125,14 +126,18 @@ def generate_signals(model, scaler, df):
 
 def run_backtest(prices, signals):
     """
-    Long-only portföy simülasyonu (komisyon + stop-loss dahil).
+    Long-only portföy simülasyonu (komisyon + stop-loss + take-profit dahil).
 
     Kurallar
     --------
     - AL (+1) ve pozisyon yokken  -> tüm bakiyeyle long aç.
     - SAT (-1) ve pozisyondayken  -> pozisyonu kapat.
-    - Stop-Loss: fiyat giriş * (1 - STOP_LOSS) altına düşerse otomatik kapat.
+    - Stop-Loss  : fiyat giriş * (1 - STOP_LOSS) altına düşerse zararına kapat.
+    - Take-Profit: fiyat giriş * (1 + TAKE_PROFIT) üstüne çıkarsa kârla kapat.
     - Her alım ve satımda COMMISSION uygulanır.
+
+    Not: Short (açığa satış) altyapısı olmadığından SL/TP yalnızca Long
+    pozisyonlar üzerinden hesaplanır.
 
     Dönüş
     -----
@@ -145,16 +150,23 @@ def run_backtest(prices, signals):
 
     total_trades = 0            # tamamlanan işlem (round-trip) sayısı
     stop_loss_hits = 0
+    take_profit_hits = 0
     equity_curve = []
 
     for price, signal in zip(prices, signals):
-        # --- 1) Stop-Loss kontrolü (pozisyondayken) ---
+        # --- 1) Risk yönetimi: Stop-Loss / Take-Profit (pozisyondayken) ---
         if in_position and price <= entry_price * (1 - STOP_LOSS):
             balance = position_qty * price * (1 - COMMISSION)  # zararına kapat
             in_position = False
             position_qty = 0.0
             total_trades += 1
             stop_loss_hits += 1
+        elif in_position and price >= entry_price * (1 + TAKE_PROFIT):
+            balance = position_qty * price * (1 - COMMISSION)  # kârla kapat
+            in_position = False
+            position_qty = 0.0
+            total_trades += 1
+            take_profit_hits += 1
 
         # --- 2) Sinyale göre aksiyon ---
         if signal == 1 and not in_position:
@@ -197,6 +209,7 @@ def run_backtest(prices, signals):
         "net_pnl_pct": net_pnl_pct,
         "total_trades": total_trades,
         "stop_loss_hits": stop_loss_hits,
+        "take_profit_hits": take_profit_hits,
         "max_drawdown_pct": max_drawdown * 100,
     }
 
@@ -213,6 +226,7 @@ def print_report(result):
     print("  " + "-" * 42)
     print(f"  Toplam İşlem Sayısı  : {result['total_trades']:>14d}")
     print(f"  Stop-Loss Tetiklenme : {result['stop_loss_hits']:>14d}")
+    print(f"  Take-Profit Tetikl.  : {result['take_profit_hits']:>14d}")
     print(f"  Max Drawdown (MDD)   : {result['max_drawdown_pct']:>13,.2f} %")
     print(line)
 

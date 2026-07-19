@@ -102,7 +102,12 @@ def prepare_data():
     print(f"[VERİ] Train sınıf dağılımı (0=SAT,1=BEKLE,2=AL): "
           f"{dict(zip(classes.tolist(), counts.tolist()))}")
 
-    # 6) NumPy -> PyTorch tensör
+    # 6) SINIF AĞIRLIKLARI (ters frekans) — sınıf dengesizliğini dengelemek için
+    class_weights = compute_class_weights(y_train, num_classes=OUTPUT_SIZE)
+    print(f"[VERİ] Sınıf ağırlıkları (0/1/2): "
+          f"{[round(w, 3) for w in class_weights.tolist()]}")
+
+    # 7) NumPy -> PyTorch tensör
     #    Girdi (X) float; hedef (y) sınıf etiketi olduğu için torch.long
     #    ve CrossEntropyLoss'un beklediği (N,) şeklinde (squeeze).
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
@@ -110,7 +115,7 @@ def prepare_data():
     X_test_t = torch.tensor(X_test, dtype=torch.float32)
     y_test_t = torch.tensor(y_test, dtype=torch.long).squeeze(-1)
 
-    # 7) DataLoader'lar (zaman serisi -> shuffle=False)
+    # 8) DataLoader'lar (zaman serisi -> shuffle=False)
     train_loader = DataLoader(
         TensorDataset(X_train_t, y_train_t), batch_size=BATCH_SIZE, shuffle=False
     )
@@ -118,7 +123,28 @@ def prepare_data():
         TensorDataset(X_test_t, y_test_t), batch_size=BATCH_SIZE, shuffle=False
     )
 
-    return train_loader, test_loader, scaler
+    return train_loader, test_loader, scaler, class_weights
+
+
+def compute_class_weights(y, num_classes=3):
+    """
+    Ters frekans (inverse frequency) mantığıyla dinamik sınıf ağırlıkları üretir.
+
+        weight_c = toplam_örnek / (sınıf_sayısı * count_c)
+
+    Böylece sık görülen sınıf (ör. 1=BEKLE) DÜŞÜK, nadir sınıflar (0=SAT, 2=AL)
+    YÜKSEK ağırlık alır. Hiç görülmeyen sınıf için 0'a bölmeyi önlemek üzere
+    count 1'e sabitlenir.
+
+    Dönüş
+    -----
+    numpy.ndarray, şekil (num_classes,)  -> float32 ağırlıklar
+    """
+    y = np.asarray(y).reshape(-1).astype(int)
+    counts = np.bincount(y, minlength=num_classes).astype(np.float64)
+    counts[counts == 0] = 1.0  # 0'a bölme koruması
+    weights = counts.sum() / (num_classes * counts)
+    return weights.astype(np.float32)
 
 
 def evaluate(model, loader, criterion):
@@ -148,7 +174,7 @@ def evaluate(model, loader, criterion):
 
 def train():
     # ---- Veri hazırlığı ----
-    train_loader, test_loader, scaler = prepare_data()
+    train_loader, test_loader, scaler, class_weights = prepare_data()
 
     # ---- Model, optimizer, loss ----
     model = TradeAILSTM(
@@ -159,7 +185,11 @@ def train():
     ).to(DEVICE)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.CrossEntropyLoss()  # sınıflandırma standardı (3 sınıf)
+
+    # Sınıf ağırlıklarını cihaza uygun tensöre çevirip loss'a entegre et.
+    # Böylece nadir SAT/AL sınıfları BEKLE'ye ezilmez (class imbalance düzeltme).
+    weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=weight_tensor)
 
     print(f"\n[EĞİTİM] Cihaz: {DEVICE} | Özellik: {INPUT_SIZE} | "
           f"Sınıf: {OUTPUT_SIZE} | Epoch: {EPOCHS}")
