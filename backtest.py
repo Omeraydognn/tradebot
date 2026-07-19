@@ -22,7 +22,12 @@ import joblib
 import numpy as np
 import torch
 
-from data_pipeline import fetch_ohlcv, add_indicators, FEATURE_COLUMNS, TARGET_COL_INDEX
+from data_pipeline import (
+    fetch_ohlcv,
+    add_indicators,
+    FEATURE_COLUMNS,
+    CLOSE_COL_INDEX,
+)
 from model import TradeAILSTM
 import train  # hiperparametreler ve yeniden-eğitim fallback'i için
 
@@ -39,9 +44,9 @@ INITIAL_BALANCE = 10_000.0   # USDT
 COMMISSION = 0.001           # işlem başına %0.1 (Binance taker)
 STOP_LOSS = 0.02             # %2 sabit stop-loss (long)
 
-# Dinamik volatilite eşiği: sabit oran yerine ATR bazlı bant kullanılır.
-# Eşik = ATR * ATR_MULTIPLIER  (piyasa oynaklığına göre otomatik genişler/daralır)
-ATR_MULTIPLIER = 0.5
+# NOT: Eşik (threshold) mantığı artık burada YOK; yön kararı doğrudan modelin
+# sınıf tahmininden (0=SAT, 1=BEKLE, 2=AL) gelir. Etiketleme eşiği eğitim
+# verisine (data_pipeline.add_indicators) gömülüdür.
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,11 +82,13 @@ def generate_signals(model, scaler, df):
     """
     Geçmiş verinin her mumu için sinyal üretir (vektörel/batch tahmin).
 
+    Model 3 sınıflı logits döndürür; argmax ile en yüksek olasılıklı sınıf
+    seçilir ve işlem sinyaline çevrilir. Eşik (threshold) hesabı YOKTUR.
+
     Her karar noktasında:
-      - Girdi  : son `seq_len` mum (ölçekli)  -> modelin close tahmini
-      - Mevcut : penceredeki son mumun gerçek kapanışı (bilinen fiyat)
-      - Eşik   : o anki mumun ATR'si * ATR_MULTIPLIER (dinamik volatilite bandı)
-      - Sinyal : tahmin, [mevcut ± eşik] bandının dışına çıkarsa üretilir
+      - Girdi  : son `seq_len` mumun ölçekli özellikleri  -> 3 sınıf logits
+      - Sınıf  : argmax(logits) -> 0 (SAT) / 1 (BEKLE) / 2 (AL)
+      - Sinyal : signal = sınıf - 1  -> -1 / 0 / +1
 
     Dönüş
     -----
@@ -89,46 +96,29 @@ def generate_signals(model, scaler, df):
     signals : np.ndarray  -> her karar için +1 / -1 / 0
     """
     seq_len = train.SEQUENCE_LENGTH
-    target_idx = TARGET_COL_INDEX
-    atr_idx = FEATURE_COLUMNS.index("atr")
 
-    # 8 özellik: OHLCV + RSI + MACD + ATR
+    # 9 özellik: OHLCV + RSI + MACD + ATR + Returns
     values = df[FEATURE_COLUMNS].values
     scaled = scaler.transform(values)
 
     # Tüm kayan pencereleri tek tensöre yığ (vektörel tahmin)
     windows = []
     current_prices = []
-    current_atrs = []
     for i in range(seq_len, len(scaled)):
         windows.append(scaled[i - seq_len:i, :])
-        # Karar anında bilinen (ham) fiyat ve ATR: penceredeki son mum
-        current_prices.append(values[i - 1, target_idx])
-        current_atrs.append(values[i - 1, atr_idx])
+        # Karar anında bilinen (ham) fiyat: penceredeki son mumun kapanışı
+        current_prices.append(values[i - 1, CLOSE_COL_INDEX])
 
     X = torch.tensor(np.array(windows), dtype=torch.float32).to(DEVICE)
     current_prices = np.array(current_prices)
-    current_atrs = np.array(current_atrs)
 
-    # Batch tahmin (0-1 ölçekli close)
+    # Batch tahmin: 3 sınıf logits -> argmax -> sınıf (0/1/2)
     with torch.no_grad():
-        preds_scaled = model(X).cpu().numpy().reshape(-1)
+        logits = model(X)                                   # (N, 3)
+        predicted_classes = torch.argmax(logits, dim=1).cpu().numpy()
 
-    # inverse_transform: 8 sütunlu dummy kurup sadece 'close'u geri çevir
-    dummy = np.zeros((len(preds_scaled), len(FEATURE_COLUMNS)))
-    dummy[:, target_idx] = preds_scaled
-    predicted_prices = scaler.inverse_transform(dummy)[:, target_idx]
-
-    # --- DİNAMİK VOLATİLİTE EŞİĞİ (ATR bazlı) ---
-    # Sabit oran yerine, her mumun ATR'sine göre değişen bir bant kurulur.
-    band = current_atrs * ATR_MULTIPLIER
-    upper_threshold = current_prices + band
-    lower_threshold = current_prices - band
-
-    signals = np.where(
-        predicted_prices > upper_threshold, 1,
-        np.where(predicted_prices < lower_threshold, -1, 0),
-    )
+    # Sınıfı sinyale çevir: 2(AL)->+1, 1(BEKLE)->0, 0(SAT)->-1  (sınıf - 1)
+    signals = predicted_classes - 1
 
     return current_prices, signals
 
