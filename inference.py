@@ -25,8 +25,10 @@ from model import TradeAILSTM
 import train  # hiperparametreler (INPUT_SIZE, SEQUENCE_LENGTH, yollar) için
 
 
-# İndikatör ısınması için ekstra mum tamponu (RSI/MACD/ATR + pct_change)
-WARMUP_BUFFER = 100
+# İndikatör ısınması için ekstra mum tamponu.
+# EMA-200 en az 200 mumluk ısınma istediğinden 250'ye çıkarıldı
+# (aksi halde add_indicators sonrası yetersiz veri hatası oluşur).
+WARMUP_BUFFER = 250
 
 # Sınıf -> (etiket, işlem sinyali) eşlemesi
 # Sınıf 0=SAT -> -1, Sınıf 1=BEKLE -> 0, Sınıf 2=AL -> +1  (yani signal = sınıf - 1)

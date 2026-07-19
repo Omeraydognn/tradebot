@@ -52,7 +52,8 @@ ATR_TP_MULT = 2.0
 
 # Güven eşiği: AL/SAT sinyali ancak sınıf olasılığı bu değerin üstündeyse
 # geçerli sayılır; altındaysa sinyal BEKLE'ye zorlanır (düşük güvenli işlem yok).
-CONFIDENCE_THRESHOLD = 0.65
+# 3 sınıflı yapıda %45, rastgeleye (%33) göre anlamlı istatistiksel avantajdır.
+CONFIDENCE_THRESHOLD = 0.45
 
 # NOT: Eşik (threshold) mantığı artık burada YOK; yön kararı doğrudan modelin
 # sınıf tahmininden (0=SAT, 1=BEKLE, 2=AL) gelir. Etiketleme eşiği eğitim
@@ -154,89 +155,129 @@ def generate_signals(model, scaler, df):
     return current_prices, current_atrs, current_emas, signals
 
 
+def _close_value(position, qty, entry_price, price):
+    """
+    Bir pozisyonu `price` fiyatından kapatınca elde edilecek nakit (komisyon dahil).
+
+    - Long  : qty * price * (1 - COMMISSION)
+    - Short : qty*(2*entry_price - price) - qty*price*COMMISSION
+             (girişte kilitlenen değer qty*entry_price; PnL = qty*(entry_price - price);
+              çıkış komisyonu geri-alım notionali üzerinden düşülür)
+    """
+    if position == 1:
+        return qty * price * (1 - COMMISSION)
+    return qty * (2 * entry_price - price) - qty * price * COMMISSION
+
+
 def run_backtest(prices, atrs, ema_200s, signals):
     """
-    Long-only portföy simülasyonu (komisyon + DİNAMİK ATR bazlı SL/TP +
-    EMA-200 trend filtresi dahil).
+    ÇİFT YÖNLÜ (Long/Short) portföy simülasyonu — komisyon + DİNAMİK ATR bazlı
+    SL/TP + EMA-200 trend filtresi.
 
-    Kurallar
-    --------
-    - AL (+1), pozisyon yok VE fiyat > EMA-200 (yukarı trend)  -> long aç.
-      Girişteki ATR (entry_atr) ile dinamik seviyeler hesaplanır:
-          stop_price = entry_price - (entry_atr * ATR_SL_MULT)
-          take_price = entry_price + (entry_atr * ATR_TP_MULT)
-    - Trend Filtresi: AL sinyali gelse bile fiyat EMA-200'ün ALTINDAysa
-      işlem REDDEDİLİR (aşağı trendde long açma).
-    - SAT (-1) ve pozisyondayken  -> pozisyonu kapat.
-    - Stop-Loss  : fiyat stop_price'a (veya altına) inerse zararına kapat.
-    - Take-Profit: fiyat take_price'a (veya üstüne) çıkarsa kârla kapat.
-    - Her alım ve satımda COMMISSION uygulanır.
+    Giriş kuralları (trend yönünde işlem)
+    -------------------------------------
+    - AL (+1), pozisyon yok, fiyat > EMA-200 (yukarı trend)  -> LONG aç.
+        stop_price = entry - (entry_atr * ATR_SL_MULT)   (altında)
+        take_price = entry + (entry_atr * ATR_TP_MULT)   (üstünde)
+    - SAT (-1), pozisyon yok, fiyat < EMA-200 (aşağı trend) -> SHORT aç.
+        stop_price = entry + (entry_atr * ATR_SL_MULT)   (üstünde)
+        take_price = entry - (entry_atr * ATR_TP_MULT)   (altında)
+    - Trend uymuyorsa (long'da fiyat<=EMA, short'ta fiyat>=EMA) işlem reddedilir.
 
-    Not: Short (açığa satış) altyapısı olmadığından SL/TP yalnızca Long
-    pozisyonlar üzerinden hesaplanır.
+    Çıkış kuralları
+    ---------------
+    - Dinamik SL/TP seviyelerine dokununca kapat.
+    - Ters sinyal gelince kapat (long'dayken SAT, short'tayken AL); ardından
+      trend uygunsa yeni yönde pozisyon açılabilir (close-and-reverse).
 
     Dönüş
     -----
     result : dict  -> metrikler ve equity eğrisi
     """
-    balance = INITIAL_BALANCE   # eldeki nakit (USDT)
-    position_qty = 0.0          # elde tutulan BTC miktarı
+    balance = INITIAL_BALANCE   # eldeki nakit (USDT) — yalnızca pozisyon yokken
+    qty = 0.0                   # pozisyon büyüklüğü (BTC birimi)
     entry_price = 0.0
     stop_price = 0.0            # girişte hesaplanan dinamik SL seviyesi
     take_price = 0.0           # girişte hesaplanan dinamik TP seviyesi
-    in_position = False
+    position = 0               # 0 = yok, +1 = LONG, -1 = SHORT
 
     total_trades = 0            # tamamlanan işlem (round-trip) sayısı
     stop_loss_hits = 0
     take_profit_hits = 0
-    trend_rejects = 0          # EMA filtresiyle reddedilen AL sinyalleri
+    trend_rejects = 0          # EMA filtresiyle reddedilen giriş sinyalleri
     equity_curve = []
 
-    for price, atr, ema, signal in zip(prices, atrs, ema_200s, signals):
-        # --- 1) Risk yönetimi: DİNAMİK Stop-Loss / Take-Profit ---
-        if in_position and price <= stop_price:
-            balance = position_qty * price * (1 - COMMISSION)  # zararına kapat
-            in_position = False
-            position_qty = 0.0
-            total_trades += 1
-            stop_loss_hits += 1
-        elif in_position and price >= take_price:
-            balance = position_qty * price * (1 - COMMISSION)  # kârla kapat
-            in_position = False
-            position_qty = 0.0
-            total_trades += 1
-            take_profit_hits += 1
+    def open_position(direction, price, atr):
+        """Verilen yönde (Long +1 / Short -1) pozisyon açar."""
+        nonlocal balance, qty, entry_price, stop_price, take_price, position
+        qty = (balance * (1 - COMMISSION)) / price
+        entry_price = price
+        if direction == 1:  # LONG
+            stop_price = entry_price - (atr * ATR_SL_MULT)
+            take_price = entry_price + (atr * ATR_TP_MULT)
+        else:               # SHORT
+            stop_price = entry_price + (atr * ATR_SL_MULT)
+            take_price = entry_price - (atr * ATR_TP_MULT)
+        balance = 0.0
+        position = direction
 
-        # --- 2) Sinyale göre aksiyon ---
-        if signal == 1 and not in_position:
-            # TREND FİLTRESİ: yalnızca fiyat EMA-200 üstündeyse (yukarı trend) al
-            if price > ema:
-                # Long aç: nakit -> BTC (komisyon düşülür)
-                position_qty = (balance * (1 - COMMISSION)) / price
-                entry_price = price
-                # Girişteki ATR'ye göre dinamik SL/TP seviyelerini sabitle
-                stop_price = entry_price - (atr * ATR_SL_MULT)
-                take_price = entry_price + (atr * ATR_TP_MULT)
-                balance = 0.0
-                in_position = True
-            else:
-                trend_rejects += 1  # aşağı trend -> AL reddedildi
-        elif signal == -1 and in_position:
-            # Pozisyonu kapat: BTC -> nakit (komisyon düşülür)
-            balance = position_qty * price * (1 - COMMISSION)
-            in_position = False
-            position_qty = 0.0
-            total_trades += 1
+    for price, atr, ema, signal in zip(prices, atrs, ema_200s, signals):
+        # --- 1) DİNAMİK Stop-Loss / Take-Profit (yöne göre) ---
+        if position == 1:
+            if price <= stop_price:           # Long SL
+                balance = _close_value(position, qty, entry_price, price)
+                position, qty = 0, 0.0
+                total_trades += 1; stop_loss_hits += 1
+            elif price >= take_price:         # Long TP
+                balance = _close_value(position, qty, entry_price, price)
+                position, qty = 0, 0.0
+                total_trades += 1; take_profit_hits += 1
+        elif position == -1:
+            if price >= stop_price:           # Short SL (fiyat yukarı gitti)
+                balance = _close_value(position, qty, entry_price, price)
+                position, qty = 0, 0.0
+                total_trades += 1; stop_loss_hits += 1
+            elif price <= take_price:         # Short TP (fiyat aşağı gitti)
+                balance = _close_value(position, qty, entry_price, price)
+                position, qty = 0, 0.0
+                total_trades += 1; take_profit_hits += 1
+
+        # --- 2) Sinyale göre: ters sinyalde kapat, trend yönünde aç ---
+        if signal == 1:        # AL
+            if position == -1:                # ters sinyal -> short'u kapat
+                balance = _close_value(position, qty, entry_price, price)
+                position, qty = 0, 0.0
+                total_trades += 1
+            if position == 0:
+                if price > ema:               # yukarı trend -> LONG aç
+                    open_position(1, price, atr)
+                else:
+                    trend_rejects += 1
+        elif signal == -1:     # SAT
+            if position == 1:                 # ters sinyal -> long'u kapat
+                balance = _close_value(position, qty, entry_price, price)
+                position, qty = 0, 0.0
+                total_trades += 1
+            if position == 0:
+                if price < ema:               # aşağı trend -> SHORT aç
+                    open_position(-1, price, atr)
+                else:
+                    trend_rejects += 1
 
         # --- 3) Anlık portföy değeri (equity) ---
-        equity = balance if not in_position else position_qty * price
+        if position == 0:
+            equity = balance
+        elif position == 1:
+            equity = qty * price                      # long değeri
+        else:
+            equity = qty * (2 * entry_price - price)  # short değeri (fiyat düşerse artar)
         equity_curve.append(equity)
 
     # Simülasyon sonunda açık pozisyon varsa son fiyattan kapat
-    if in_position:
-        balance = position_qty * prices[-1] * (1 - COMMISSION)
-        in_position = False
+    if position != 0:
+        balance = _close_value(position, qty, entry_price, prices[-1])
         total_trades += 1
+        position, qty = 0, 0.0
         equity_curve[-1] = balance
 
     equity_curve = np.array(equity_curve)
