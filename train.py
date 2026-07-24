@@ -33,9 +33,13 @@ from model import TradeAILSTM
 
 # ----------------------- Hiperparametreler -----------------------
 SYMBOL = "BTC/USDT"
-TIMEFRAME = "1h"
-LIMIT = 5000  # ~7 ay (sayfalama ile derin veri) — daha geniş piyasa döngüsü
+TIMEFRAME = "1h"  # zaman dilimi tek kaynak: backtest/inference train.TIMEFRAME'i kullanır
+LIMIT = 10000  # derin tarih (funding intraday sinyali için en çok veri)
 SEQUENCE_LENGTH = 60
+
+# Walk-forward: model yalnızca kronolojik ilk TRAIN_CANDLES mumu görür.
+# Son (LIMIT - TRAIN_CANDLES) mum backtest.py'de 'görülmemiş sınav' verisidir.
+TRAIN_CANDLES = 7000
 
 TRAIN_RATIO = 0.8
 BATCH_SIZE = 32
@@ -71,6 +75,11 @@ def prepare_data():
     df = fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=LIMIT)
     df = add_indicators(df)
     print(f"[VERİ] İşlenmiş veri şekli: {df.shape}  ({FEATURE_COLUMNS})")
+
+    # 1b) WALK-FORWARD İZOLASYON: model yalnızca kronolojik ilk 4000 mumu görür.
+    #     Son 2000 mum tamamen dışarıda tutulur (out-of-sample, backtest'e ayrılır).
+    df = df.iloc[:TRAIN_CANDLES]
+    print(f"[VERİ] Eğitim izolasyonu -> ilk {TRAIN_CANDLES} mum kullanılıyor: {df.shape}")
 
     # 2) Zaman sırasına göre böl (KARIŞTIRMA YOK)
     split_idx = int(len(df) * TRAIN_RATIO)

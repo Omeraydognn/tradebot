@@ -28,76 +28,108 @@ from sklearn.preprocessing import MinMaxScaler
 MAX_CANDLES_PER_REQUEST = 1000
 
 
-# Ham OHLCV sütunları
+# Ham OHLCV sütunları (borsadan gelir; yardımcı — özellik türetmek ve
+# simülasyon/fiyat için kullanılır)
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 
-# Teknik indikatör sütunları (ema_200 = uzun vadeli trend filtresi)
-INDICATOR_COLUMNS = ["rsi", "macd", "atr", "ema_200"]
+# ===========================================================================
+# STRATEJİ: MEAN-REVERSION (Ortalamaya Dönüş)
+# ---------------------------------------------------------------------------
+# Yön (momentum/trend) tahmini yerine AŞIRILIK ölçen özellikler kullanılır.
+# Fiyat 20 mumluk ortalamadan çok saparsa (z-score |>2|) ortalamaya geri
+# dönmesi beklenir. Girdiler durağan/aşırılık göstergeleridir.
+# ===========================================================================
+FEATURE_COLUMNS = [
+    "price_zscore",      # (close - MA20) / STD20         -> fiyat aşırılığı (kaç std)
+    "flow_imb_zscore",   # order-flow imbalance'ın 20-Z   -> agresif akış aşırılığı
+    "rsi",               # RSI(14)                         -> aşırı alım/satım
+    "atr",               # ATR(14)                         -> volatilite
+    "volume",            # hacim                           -> katılım
+]
 
-# Yüzdelik getiri sütunu (durağan; hem girdi özelliği hem de etiketin kaynağı)
-RETURNS_COLUMN = "returns"
-
-# Modelin GİRDİ olarak gördüğü özellik seti (5 + 3 + 1 = 9 özellik)
-FEATURE_COLUMNS = OHLCV_COLUMNS + INDICATOR_COLUMNS + [RETURNS_COLUMN]
+# Yardımcı (girdi olmayan) sütunlar — DataFrame'de bulunur, X'e girmez.
+# close/high/low backtest & inference'ta fiyat/SL-TP için; bb_mid ortalama seviyesi;
+# flow_imb & taker_buy z-score'un ham kaynağıdır.
+HELPER_COLUMNS = [
+    "open", "high", "low", "close", "taker_buy",
+    "flow_imb", "bb_mid", "bb_high", "bb_low",
+]
 
 # Hedef: SINIFLANDIRMA etiketi -> 0 (SAT), 1 (BEKLE), 2 (AL)
 TARGET_COLUMN = "target_class"
 
-# Etiketleme eşiği katsayısı: atr_threshold = (atr/close) * LABEL_ATR_MULTIPLIER
-# (Eskiden inference/backtest'te olan eşik mantığı artık eğitim verisine gömülü.)
-LABEL_ATR_MULTIPLIER = 0.5
+# --- Mean-reversion parametreleri ---
+ZSCORE_WINDOW = 20      # z-score / Bollinger penceresi
+ZSCORE_THRESHOLD = 2.0  # |z| > 2 -> fiyat 'aşırı gerilmiş' sayılır
+REVERSION_HORIZON = 3   # sonraki kaç mumda ortalamaya dönüş aranır
 
 # Sınıf tanımları (okunabilirlik için)
-CLASS_SELL = 0   # AŞAĞI
-CLASS_HOLD = 1   # YATAY
-CLASS_BUY = 2    # YUKARI
-
-# Simülasyonda gereken ham sütun indeksi (FEATURE_COLUMNS içinde)
-CLOSE_COL_INDEX = FEATURE_COLUMNS.index("close")  # = 3
+CLASS_SELL = 0   # ortalamaya AŞAĞI dönecek (yukarı aşırılık)
+CLASS_HOLD = 1   # aşırılık yok / dönüş yok
+CLASS_BUY = 2    # ortalamaya YUKARI dönecek (aşağı aşırılık)
 
 
 def fetch_ohlcv(symbol="BTC/USDT", timeframe="1h", limit=500, exchange_name="binance"):
     """
-    Bir borsadan (varsayılan: Binance) geçmiş OHLCV verisi çeker.
+    Binance ham kline verisini (12 alan) sayfalama ile çeker. Standart OHLCV'ye
+    ek olarak 'taker_buy' (agresif ALIŞ hacmi) alanını da saklar — order-flow
+    imbalance özelliği bundan türetilir (bedava + geçmişe dönük).
 
-    SAYFALAMA (pagination): Binance tek istekte en fazla 1000 mum döndürdüğü
-    için, `limit` 1000'den büyükse `since` parametresi ve bir `while` döngüsü
-    ile veriler parça parça çekilip birleştirilir. Her sayfadan sonra IP ban
-    riskini azaltmak için `time.sleep(1)` beklenir.
+    SAYFALAMA: Binance tek istekte en fazla 1000 mum döndürür; `startTime` ve
+    bir `while` döngüsüyle parça parça birleştirilir, her sayfada time.sleep(1).
+
+    NOT: Ham kline (publicGetKlines) Binance'e özgüdür; exchange_name yalnızca
+    'binance' için geçerlidir (projede tek kullanılan borsa).
 
     Dönüş
     -----
-    pandas.DataFrame  (sütunlar: [open, high, low, close, volume], index: timestamp)
+    pandas.DataFrame  (sütunlar: open, high, low, close, volume, taker_buy)
     """
     exchange_class = getattr(ccxt, exchange_name)
     exchange = exchange_class({"enableRateLimit": True})
 
-    # timeframe'in milisaniye cinsinden süresi (ör. '1h' -> 3_600_000 ms)
     timeframe_ms = exchange.parse_timeframe(timeframe) * 1000
-
-    # Başlangıç: en yeni `limit` mumu kapsayacak şekilde geçmişe git
+    market_id = symbol.replace("/", "")  # 'BTC/USDT' -> 'BTCUSDT'
     since = exchange.milliseconds() - limit * timeframe_ms
 
-    all_candles = []
-    while len(all_candles) < limit:
-        remaining = limit - len(all_candles)
+    all_rows = []
+    while len(all_rows) < limit:
+        remaining = limit - len(all_rows)
         page_limit = min(MAX_CANDLES_PER_REQUEST, remaining)
 
-        batch = exchange.fetch_ohlcv(
-            symbol, timeframe=timeframe, since=since, limit=page_limit
-        )
+        # Ham kline: [openTime,o,h,l,c,v,closeTime,quoteVol,nTrades,
+        #             takerBuyBase(9), takerBuyQuote, ignore]
+        batch = exchange.publicGetKlines({
+            "symbol": market_id,
+            "interval": timeframe,
+            "startTime": int(since),
+            "limit": page_limit,
+        })
         if not batch:
             break
 
-        all_candles += batch
-        since = batch[-1][0] + timeframe_ms
+        all_rows += batch
+        since = int(batch[-1][0]) + timeframe_ms
 
         if len(batch) < page_limit:
             break
 
         time.sleep(1)  # IP ban yememek için sayfalar arası bekleme
 
-    df = pd.DataFrame(all_candles, columns=["timestamp"] + OHLCV_COLUMNS)
+    records = [
+        {
+            "timestamp": int(k[0]),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+            "taker_buy": float(k[9]),  # agresif alış hacmi (order-flow)
+        }
+        for k in all_rows
+    ]
+
+    df = pd.DataFrame(records)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("timestamp", inplace=True)
 
@@ -107,57 +139,78 @@ def fetch_ohlcv(symbol="BTC/USDT", timeframe="1h", limit=500, exchange_name="bin
 
 def add_indicators(df):
     """
-    DataFrame'e teknik indikatörleri + yüzdelik getiriyi ekler ve
-    NaN satırlarını temizler.
+    MEAN-REVERSION veri hazırlığı: aşırılık/z-score özellikleri + ortalamaya
+    dönüş hedefi ekler, NaN satırlarını temizler.
 
-    Eklenen sütunlar:
-      - rsi          : RSI(14)   -> aşırı alım/satım
-      - macd         : MACD(12, 26)  -> trend momentumu (MACD çizgisi)
-      - atr          : ATR(14)   -> volatilite
-      - ema_200      : EMA(200)  -> uzun vadeli trend yönü (trend filtresi)
-      - returns      : close.pct_change()  -> DURAĞAN yüzdelik getiri (girdi + etiket kaynağı)
-      - target_class : 0 (SAT) / 1 (BEKLE) / 2 (AL)  -> SINIFLANDIRMA hedefi
+    GİRDİ özellikleri (FEATURE_COLUMNS):
+      - price_zscore     : (close - MA20) / STD20       -> fiyat aşırılığı
+      - flow_imb_zscore  : order-flow imbalance'ın 20-Z  -> akış aşırılığı
+      - rsi              : RSI(14)                         -> aşırı alım/satım
+      - atr              : ATR(14)                         -> volatilite
+      - volume           : hacim                           -> katılım
 
-    Etiketleme mantığı (ATR bazlı dinamik eşik doğrudan veriye gömülür):
-      atr_threshold = (atr / close) * LABEL_ATR_MULTIPLIER
-        returns >  atr_threshold  -> 2 (AL/YUKARI)
-        returns < -atr_threshold  -> 0 (SAT/AŞAĞI)
-        aksi halde                -> 1 (BEKLE/YATAY)
+    Yardımcı sütunlar (df'de kalır, girdi değil): open/high/low/close,
+    taker_buy, flow_imb, bb_mid/bb_high/bb_low.
+
+    HEDEF (mean-reversion):
+      MA20 = close.rolling(20).mean()  (ortalama; dönüş hedefi)
+      - price_zscore < -2.0  VE  sonraki 3 mumun EN YÜKSEĞİ >= MA20  -> 2 (AL)
+      - price_zscore > +2.0  VE  sonraki 3 mumun EN DÜŞÜĞÜ  <= MA20  -> 0 (SAT)
+      - aksi halde                                                    -> 1 (BEKLE)
+
+    NOT: Hedef ileriye bakar (sonraki H mum) — bu bir ETİKET; sızıntı değildir.
+    Girdiler (X) yalnızca geçmişe bakar. Verinin son H satırının etiketi tam
+    belirlenemez (gelecek yok) ve BEKLE'ye düşer; bu satırlar train hedefinde
+    kullanılmaz (OOS kuyruğunda kalır), backtest/inference hedefi kullanmaz.
 
     Dönüş
     -----
     pandas.DataFrame  (yeni sütunlar eklenmiş, NaN'ler atılmış)
     """
     df = df.copy()
+    W = ZSCORE_WINDOW
+    H = REVERSION_HORIZON
 
-    # RSI (14)
+    # --- Girdi indikatörleri ---
     df["rsi"] = ta.momentum.RSIIndicator(close=df["close"], window=14).rsi()
-
-    # MACD (12, 26, 9) -> MACD çizgisi
-    macd = ta.trend.MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
-    df["macd"] = macd.macd()
-
-    # ATR (14)
     df["atr"] = ta.volatility.AverageTrueRange(
         high=df["high"], low=df["low"], close=df["close"], window=14
     ).average_true_range()
 
-    # EMA (200) -> uzun vadeli trend yönü (fiyat > ema_200 ise yukarı trend)
-    df["ema_200"] = ta.trend.EMAIndicator(close=df["close"], window=200).ema_indicator()
+    # Bollinger Bands (20, 2) — fiyatın durağan bandı (yardımcı)
+    bb = ta.volatility.BollingerBands(close=df["close"], window=W, window_dev=2)
+    df["bb_mid"] = bb.bollinger_mavg()   # = MA20 (ortalama; dönüş hedefi)
+    df["bb_high"] = bb.bollinger_hband()
+    df["bb_low"] = bb.bollinger_lband()
 
-    # Yüzdelik getiri: bir önceki muma göre % değişim (durağan seri)
-    df["returns"] = df["close"].pct_change()
+    # Fiyat Z-Score (aşırılık): kaç standart sapma uzakta
+    ma20 = df["close"].rolling(W).mean()
+    std20 = df["close"].rolling(W).std()
+    df["price_zscore"] = (df["close"] - ma20) / std20
 
-    # --- SINIFLANDIRMA HEDEFİ (target_class) ---
-    # ATR bazlı dinamik eşik: fiyatın yüzdesi olarak volatilite bandı
-    atr_threshold = (df["atr"] / df["close"]) * LABEL_ATR_MULTIPLIER
+    # Order-flow imbalance [-1,1] + 20 mumluk rolling Z-Score (akış aşırılığı)
+    df["flow_imb"] = (2 * df["taker_buy"] - df["volume"]) / df["volume"]
+    df["flow_imb"] = df["flow_imb"].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    f_mean = df["flow_imb"].rolling(W).mean()
+    f_std = df["flow_imb"].rolling(W).std()
+    df["flow_imb_zscore"] = (df["flow_imb"] - f_mean) / f_std
+
+    # Bölme kaynaklı sonsuzları temizle (std=0 gibi dejenere durumlar)
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # --- MEAN-REVERSION HEDEFİ (target_class) ---
+    # Sonraki H mumun en yükseği / en düşüğü (ileriye bakan pencere = ETİKET):
+    #   high.rolling(H).max().shift(-H) -> satır i için max(high[i+1..i+H])
+    future_max_high = df["high"].rolling(H).max().shift(-H)
+    future_min_low = df["low"].rolling(H).min().shift(-H)
+
+    cond_buy = (df["price_zscore"] < -ZSCORE_THRESHOLD) & (future_max_high >= ma20)
+    cond_sell = (df["price_zscore"] > ZSCORE_THRESHOLD) & (future_min_low <= ma20)
     df["target_class"] = np.select(
-        [df["returns"] > atr_threshold, df["returns"] < -atr_threshold],
-        [CLASS_BUY, CLASS_SELL],
-        default=CLASS_HOLD,
+        [cond_buy, cond_sell], [CLASS_BUY, CLASS_SELL], default=CLASS_HOLD
     ).astype(int)
 
-    # İndikatör ısınması + pct_change kaynaklı NaN'leri temizle
+    # Isınma (rolling) kaynaklı NaN'leri temizle
     df.dropna(inplace=True)
 
     return df
@@ -231,9 +284,12 @@ if __name__ == "__main__":
     df = fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=LIMIT)
     print(f"   Ham DataFrame şekli: {df.shape}")
 
-    print("2) İndikatör + returns + target_class ekleniyor...")
+    print("2) Mean-reversion özellikleri + target_class ekleniyor...")
     df = add_indicators(df)
     print(f"   İşlenmiş şekil: {df.shape}  (özellikler: {FEATURE_COLUMNS})")
+    print(f"   price_zscore aralığı: [{df['price_zscore'].min():.2f}, "
+          f"{df['price_zscore'].max():.2f}] | |z|>2 oranı: "
+          f"{(df['price_zscore'].abs() > ZSCORE_THRESHOLD).mean()*100:.1f}%")
 
     print("3) Girdi özellikleri ölçekleniyor (hedef sınıf ölçeklenmez)...")
     scaled, scaler = scale_features(df)

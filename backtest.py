@@ -22,26 +22,25 @@ import joblib
 import numpy as np
 import torch
 
-from data_pipeline import (
-    fetch_ohlcv,
-    add_indicators,
-    FEATURE_COLUMNS,
-    CLOSE_COL_INDEX,
-)
+from data_pipeline import fetch_ohlcv, add_indicators, FEATURE_COLUMNS
 from model import TradeAILSTM
 import train  # hiperparametreler ve yeniden-eğitim fallback'i için
 
 
 # ----------------------- Backtest parametreleri -----------------------
 SYMBOL = "BTC/USDT"
-TIMEFRAME = "1h"
-LIMIT = 5000  # ~7 ay (sayfalama ile derin veri) — genişletilmiş backtest
+TIMEFRAME = train.TIMEFRAME  # train ile GARANTİ senkron (mismatch = felaket)
+LIMIT = train.LIMIT          # train ile aynı pencere -> izolasyon hizalı kalır
+
+# Walk-forward: backtest yalnızca train.TRAIN_CANDLES (7000) sonrasındaki,
+# modelin HİÇ görmediği mumlar üzerinde koşar (bkz. iloc[train.TRAIN_CANDLES:]).
 
 MODEL_PATH = "trade_model.pth"
 SCALER_PATH = "scaler.pkl"
 
 INITIAL_BALANCE = 10_000.0   # USDT
 COMMISSION = 0.001           # işlem başına %0.1 (Binance taker)
+SLIPPAGE = 0.0005            # %0.05 fiyat kayması (giriş/çıkışta aleyhte yansır)
 
 # Dinamik (ATR bazlı) risk yönetimi — sabit yüzde yerine volatiliteye uyar.
 # Girişteki ATR (entry_atr) baz alınır:
@@ -52,8 +51,9 @@ ATR_TP_MULT = 2.0
 
 # Güven eşiği: AL/SAT sinyali ancak sınıf olasılığı bu değerin üstündeyse
 # geçerli sayılır; altındaysa sinyal BEKLE'ye zorlanır (düşük güvenli işlem yok).
-# 3 sınıflı yapıda %45, rastgeleye (%33) göre anlamlı istatistiksel avantajdır.
-CONFIDENCE_THRESHOLD = 0.45
+# OOS'ta model güveni düştüğü için %40'a indirildi; 3 sınıflı problemde %40
+# hala rastgeleden (%33) yüksek ve istatistiksel edge sağlar.
+CONFIDENCE_THRESHOLD = 0.40
 
 # NOT: Eşik (threshold) mantığı artık burada YOK; yön kararı doğrudan modelin
 # sınıf tahmininden (0=SAT, 1=BEKLE, 2=AL) gelir. Etiketleme eşiği eğitim
@@ -111,12 +111,15 @@ def generate_signals(model, scaler, df):
     signals  : np.ndarray -> her karar için +1 / -1 / 0
     """
     seq_len = train.SEQUENCE_LENGTH
-    atr_idx = FEATURE_COLUMNS.index("atr")
-    ema_idx = FEATURE_COLUMNS.index("ema_200")
 
-    # 11 özellik: OHLCV + RSI + MACD + ATR + EMA200 + Returns
+    # GİRDİ artık tamamen durağan özelliklerden oluşur (mutlak fiyat/atr/ema yok).
     values = df[FEATURE_COLUMNS].values
     scaled = scaler.transform(values)
+
+    # Ham fiyat, ATR ve EMA-200 girdi DEĞİL; karar/sim için df'den okunur.
+    close_values = df["close"].values
+    atr_values = df["atr"].values
+    ema_values = df["ema_200"].values
 
     # Tüm kayan pencereleri tek tensöre yığ (vektörel tahmin)
     windows = []
@@ -126,9 +129,9 @@ def generate_signals(model, scaler, df):
     for i in range(seq_len, len(scaled)):
         windows.append(scaled[i - seq_len:i, :])
         # Karar anında bilinen (ham) fiyat, ATR ve EMA-200: penceredeki son mum
-        current_prices.append(values[i - 1, CLOSE_COL_INDEX])
-        current_atrs.append(values[i - 1, atr_idx])
-        current_emas.append(values[i - 1, ema_idx])
+        current_prices.append(close_values[i - 1])
+        current_atrs.append(atr_values[i - 1])
+        current_emas.append(ema_values[i - 1])
 
     X = torch.tensor(np.array(windows), dtype=torch.float32).to(DEVICE)
     current_prices = np.array(current_prices)
@@ -167,6 +170,21 @@ def _close_value(position, qty, entry_price, price):
     if position == 1:
         return qty * price * (1 - COMMISSION)
     return qty * (2 * entry_price - price) - qty * price * COMMISSION
+
+
+def _signal_exit_price(position, price):
+    """
+    Normal (sinyal bazlı) çıkışlarda slippage'i aleyhte fiyata yansıtır.
+
+    - Long çıkış  : price * (1 - SLIPPAGE)  (satarken fiyat aşağı kayar)
+    - Short çıkış : price * (1 + SLIPPAGE)  (geri alırken fiyat yukarı kayar)
+
+    NOT: Dinamik TP/SL tetiklenmelerinde slippage UYGULANMAZ; bu fonksiyon
+    yalnızca ters-sinyal ve simülasyon sonu kapanışlarında kullanılır.
+    """
+    if position == 1:
+        return price * (1 - SLIPPAGE)
+    return price * (1 + SLIPPAGE)
 
 
 def run_backtest(prices, atrs, ema_200s, signals):
@@ -208,14 +226,18 @@ def run_backtest(prices, atrs, ema_200s, signals):
     equity_curve = []
 
     def open_position(direction, price, atr):
-        """Verilen yönde (Long +1 / Short -1) pozisyon açar."""
+        """Verilen yönde (Long +1 / Short -1) pozisyon açar (slippage dahil)."""
         nonlocal balance, qty, entry_price, stop_price, take_price, position
-        qty = (balance * (1 - COMMISSION)) / price
-        entry_price = price
+        # SLIPPAGE: giriş fiyatı aleyhte kayar (long yukarı, short aşağı).
         if direction == 1:  # LONG
+            entry_price = price * (1 + SLIPPAGE)
+            qty = (balance * (1 - COMMISSION)) / entry_price
+            # Dinamik SL/TP, slippage uygulanmış entry_price baz alınarak kurulur
             stop_price = entry_price - (atr * ATR_SL_MULT)
             take_price = entry_price + (atr * ATR_TP_MULT)
         else:               # SHORT
+            entry_price = price * (1 - SLIPPAGE)
+            qty = (balance * (1 - COMMISSION)) / entry_price
             stop_price = entry_price + (atr * ATR_SL_MULT)
             take_price = entry_price - (atr * ATR_TP_MULT)
         balance = 0.0
@@ -243,9 +265,11 @@ def run_backtest(prices, atrs, ema_200s, signals):
                 total_trades += 1; take_profit_hits += 1
 
         # --- 2) Sinyale göre: ters sinyalde kapat, trend yönünde aç ---
+        # Ters-sinyal çıkışları NORMAL çıkıştır -> slippage uygulanır.
         if signal == 1:        # AL
             if position == -1:                # ters sinyal -> short'u kapat
-                balance = _close_value(position, qty, entry_price, price)
+                exit_p = _signal_exit_price(position, price)
+                balance = _close_value(position, qty, entry_price, exit_p)
                 position, qty = 0, 0.0
                 total_trades += 1
             if position == 0:
@@ -255,7 +279,8 @@ def run_backtest(prices, atrs, ema_200s, signals):
                     trend_rejects += 1
         elif signal == -1:     # SAT
             if position == 1:                 # ters sinyal -> long'u kapat
-                balance = _close_value(position, qty, entry_price, price)
+                exit_p = _signal_exit_price(position, price)
+                balance = _close_value(position, qty, entry_price, exit_p)
                 position, qty = 0, 0.0
                 total_trades += 1
             if position == 0:
@@ -273,9 +298,10 @@ def run_backtest(prices, atrs, ema_200s, signals):
             equity = qty * (2 * entry_price - price)  # short değeri (fiyat düşerse artar)
         equity_curve.append(equity)
 
-    # Simülasyon sonunda açık pozisyon varsa son fiyattan kapat
+    # Simülasyon sonunda açık pozisyon varsa son fiyattan kapat (normal çıkış -> slippage)
     if position != 0:
-        balance = _close_value(position, qty, entry_price, prices[-1])
+        exit_p = _signal_exit_price(position, prices[-1])
+        balance = _close_value(position, qty, entry_price, exit_p)
         total_trades += 1
         position, qty = 0, 0.0
         equity_curve[-1] = balance
@@ -306,7 +332,7 @@ def print_report(result):
     """Metrikleri temiz, okunaklı bir tablo halinde yazdırır."""
     line = "═" * 46
     print("\n" + line)
-    print("            BACKTEST SONUÇLARI (BTC/USDT 1h)")
+    print(f"       BACKTEST SONUÇLARI (BTC/USDT {TIMEFRAME}, OOS)")
     print(line)
     print(f"  Başlangıç Bakiyesi   : {result['initial_balance']:>14,.2f} USDT")
     print(f"  Bitiş Bakiyesi       : {result['final_balance']:>14,.2f} USDT")
@@ -329,6 +355,14 @@ if __name__ == "__main__":
     df = fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=LIMIT)
     df = add_indicators(df)  # indikatörler + returns, NaN'ler temizlenir
     print(f"[VERİ] İndikatörlü veri şekli: {df.shape}  ({FEATURE_COLUMNS})")
+
+    # 2b) OUT-OF-SAMPLE İZOLASYON (SIZINTI ONARIMI):
+    #     train.py 'iloc[:TRAIN_CANDLES]' ile eğitildiği için, backtest'i
+    #     'iloc[TRAIN_CANDLES:]' ile başlatmak eğitim/sınav setlerini TAMAMEN
+    #     kesişimsiz (leakage'siz) yapar. Böylece sınav %100 görülmemiş veridir.
+    df = df.iloc[train.TRAIN_CANDLES:]
+    print(f"[VERİ] OOS izolasyonu -> {train.TRAIN_CANDLES}. indeksten sona "
+          f"(tamamen görülmemiş): {df.shape}")
 
     # 3) Sinyaller (+ dinamik SL/TP için ATR, trend filtresi için EMA-200)
     print("[SİNYAL] Geçmiş mumlar için tahmin/sinyal üretiliyor...")

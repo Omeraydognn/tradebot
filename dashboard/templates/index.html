@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket AI Trading System</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header glass-panel">
+            <div class="header-title">
+                <h1>Polymarket AI Trading System</h1>
+            </div>
+            <div class="header-tickers">
+                <div class="ticker-box">
+                    <span class="ticker-label">BTC/USD</span>
+                    <span class="ticker-value monospace" id="btc-price">--</span>
+                </div>
+                <div class="ticker-box polymarket-box">
+                    <div class="pm-question" id="pm-question">BTC 5m Up/Down</div>
+                    <div class="pm-prices">
+                        <div class="pm-side pm-up">
+                            <span class="pm-label">UP</span>
+                            <span class="pm-val monospace" id="pm-up-price">--</span>
+                        </div>
+                        <div class="pm-side pm-down">
+                            <span class="pm-label">DOWN</span>
+                            <span class="pm-val monospace" id="pm-down-price">--</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Strategy Grid -->
+        <section class="strategies-grid" id="strategies-grid">
+            <!-- Strategy cards will be injected here by JS -->
+        </section>
+
+        <!-- Lower Section (Leaderboard & Logs) -->
+        <div class="lower-section">
+            <div class="glass-panel leaderboard-panel">
+                <h2>Leaderboard</h2>
+                <div class="table-container scrollable">
+                    <table id="leaderboard-table">
+                        <thead>
+                            <tr>
+                                <th>Strategy</th>
+                                <th>P&L</th>
+                                <th>Win Rate</th>
+                                <th>Performance</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Rows injected by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="glass-panel trades-panel">
+                <h2>Recent Trades</h2>
+                <div class="table-container scrollable">
+                    <table id="recent-trades-table">
+                        <thead>
+                            <tr>
+                                <th>Strategy</th>
+                                <th>Side</th>
+                                <th>Price</th>
+                                <th>Amt</th>
+                                <th>Result</th>
+                                <th>P&L</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Rows injected by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="glass-panel feed-panel">
+                <h2>AI Decision Feed</h2>
+                <div class="feed-container scrollable" id="decision-feed">
+                    <!-- Feed items injected by JS -->
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>
