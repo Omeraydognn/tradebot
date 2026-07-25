@@ -96,6 +96,8 @@ class MarketDataService:
         self.window_open_price: dict[int, float] = {}
         # 5dk pencere -> son görülen Polymarket UP fiyatı (piyasanın kendi kararı)
         self.window_last_up_price: dict[int, float] = {}
+        # 5dk pencere -> Polymarket'in RESMİ sonucu ("UP"/"DOWN"). Tek doğru kaynak.
+        self.window_official_outcome: dict[int, str] = {}
         # 5dk pencere -> pencere BAŞINDAKİ mikroyapı (online model bunu öğrenir;
         # ileriye bakış yok: sadece pencere başında bilinen bilgi)
         self.window_micro: dict[int, dict] = {}
@@ -572,6 +574,62 @@ class MarketDataService:
         now = int(time.time())
         base = now - (now % 300)  # şu anki 5-dk sınırı
         return [f"{POLY_SLUG_PREFIX}{base}", f"{POLY_SLUG_PREFIX}{base + 300}"]
+
+    async def fetch_official_outcome(self, window_start: int) -> Optional[str]:
+        """
+        Bir pencerenin RESMİ sonucunu Polymarket'ten çeker: "UP" / "DOWN" / None.
+
+        NEDEN KRİTİK:
+          Bu piyasalar Binance ile DEĞİL, Chainlink BTC/USD data stream ile
+          çözülür (piyasa açıklamasında açıkça yazıyor). Ölçtük: Binance fiyat
+          kıyasıyla karar vermek pencerelerin ~%8'inde YANLIŞ sonuç veriyor —
+          çünkü 5 dakikalık hareket çoğu zaman birkaç dolar ve iki kaynak
+          arasındaki küçük fark sonucu ters çeviriyor.
+
+          Yanlış sonuç = yanlış P&L + kalibrasyona yanlış sinyal + online
+          modelin bozuk etiketle öğrenmesi. Bu yüzden tek doğru kaynak
+          piyasanın kendi resmi çözümüdür.
+
+        Sonuç henüz belli değilse None döner (çağıran tekrar denemeli).
+        Sonuçlar cache'lenir; aynı pencere iki kez sorgulanmaz.
+        """
+        cached = self.window_official_outcome.get(window_start)
+        if cached:
+            return cached
+
+        slug = f"{POLY_SLUG_PREFIX}{window_start}"
+        try:
+            mk = await self.client.get_market(slug=slug)
+            d = mk.model_dump()
+
+            status = (d.get("resolution") or {}).get("uma_resolution_status")
+            if status is None:
+                return None  # henüz çözülmemiş
+
+            yes = (d.get("outcomes") or {}).get("yes") or {}
+            price = yes.get("price")
+            if price is None:
+                return None
+            price = float(price)
+            # Çözülmüş piyasada kazanan taraf 1, kaybeden 0 olur
+            if price >= 0.9:
+                outcome = "UP"
+            elif price <= 0.1:
+                outcome = "DOWN"
+            else:
+                return None  # kesinleşmemiş, bekle
+
+            self.window_official_outcome[window_start] = outcome
+            # Bellek: 2 saatten eski kayıtları at
+            cutoff = int(time.time()) - 7200
+            self.window_official_outcome = {
+                w: o for w, o in self.window_official_outcome.items() if w >= cutoff
+            }
+            return outcome
+
+        except Exception as e:
+            logger.debug(f"Resmi sonuç alınamadı ({slug}): {e}")
+            return None
 
     async def fetch_polymarket_data(self):
         """Hesaplanan slug ile aktif BTC 5m piyasasını bulur ve fiyat/order book çeker."""
