@@ -216,13 +216,22 @@ def bootstrap_from_history(model: "OnlineLogisticModel", limit: int = 500) -> in
 
     Dönüş: öğrenilen pencere sayısı.
     """
-    try:
-        import ccxt
-        ex = ccxt.binance({"enableRateLimit": True})
-        market_id = "BTCUSDT"
-        raw = ex.publicGetKlines({"symbol": market_id, "interval": "5m", "limit": min(limit, 1000)})
-    except Exception as e:
-        logger.warning(f"Geçmiş veri çekilemedi (model bootstrap atlandı): {e}")
+    # Binance'in ana REST domaini (api.binance.com) bazı bulut sağlayıcı IP'lerinde
+    # (Render, AWS, GCP…) HTTP 451 ile engellenir. Resmi mirror'a (data-api.binance.vision)
+    # otomatik düşülür — market_data.py'deki SPOT_REST_HOSTS ile aynı strateji.
+    hosts = ["https://api.binance.com", "https://data-api.binance.vision"]
+    raw = None
+    for base in hosts:
+        try:
+            import urllib.request, json as _json
+            url = f"{base}/api/v3/klines?symbol=BTCUSDT&interval=5m&limit={min(limit, 1000)}"
+            with urllib.request.urlopen(url, timeout=15) as r:
+                raw = _json.loads(r.read().decode())
+            break
+        except Exception as e:
+            logger.debug(f"Geçmiş veri ({base}) başarısız: {e}")
+    if raw is None:
+        logger.warning("Geçmiş veri çekilemedi (model bootstrap atlandı) — tüm domainler başarısız.")
         return 0
 
     rows = []
