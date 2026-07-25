@@ -70,23 +70,44 @@ async def strategy_loop(agents: list[AIAgent], data: MarketDataService, paper: P
             except Exception as e:
                 logger.error(f"Error in {agent.name}: {e}")
 
-        # Every 5 minutes (30 cycles × 10s), simulate resolution
-        # In production, we'd watch for actual Polymarket resolution
-        if cycle % 30 == 0:
-            # Determine outcome based on price movement
-            prices = data.recent_price_changes(300)  # last 5 min
-            if len(prices) >= 2:
-                if prices[-1] >= prices[0]:
-                    outcome = "UP"
-                else:
-                    outcome = "DOWN"
-                paper.resolve_all_pending(outcome)
-                logger.info(
-                    f"🔔 5-min resolution: {outcome} | "
-                    f"Start: ${prices[0]:,.2f} → End: ${prices[-1]:,.2f}"
-                )
+        # Resolution: her trade KENDİ 5dk penceresinin sonunda, o penceredeki
+        # gerçek BTC hareketine (açılış vs kapanış) göre çözülür.
+        resolved = resolve_due_trades(data, paper)
+
+        # İşlem sonuçlandıysa: ajanlar öğrenip stratejilerini adapte etsin
+        if resolved:
+            for agent in agents:
+                try:
+                    agent.maybe_adapt()
+                except Exception as e:
+                    logger.error(f"Adapt error in {agent.name}: {e}")
 
         await asyncio.sleep(10)
+
+
+def resolve_due_trades(data: MarketDataService, paper: PaperTrader) -> int:
+    """
+    Zamanı gelen (pencere sonu geçmiş) bekleyen trade'leri gerçek sonuçla çözer.
+    Çözülen trade sayısını döndürür (adaptasyon tetiklemek için).
+    """
+    now = time.time()
+    resolved = 0
+    for portfolio in paper.portfolios.values():
+        for trade in list(portfolio.pending_trades):
+            if not trade.resolve_at or now < trade.resolve_at:
+                continue
+            open_price = data.window_open_price.get(trade.market_window)
+            close_price = data.latest_btc_price
+            if not open_price or not close_price:
+                continue
+            outcome = "UP" if close_price >= open_price else "DOWN"
+            paper.resolve_trade(trade, outcome)
+            resolved += 1
+            logger.info(
+                f"🔔 [{trade.strategy_name}] resolution: {outcome} | "
+                f"pencere ${open_price:,.2f} → ${close_price:,.2f}"
+            )
+    return resolved
 
 
 async def main():

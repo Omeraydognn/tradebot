@@ -17,6 +17,9 @@ from polymarket import AsyncPublicClient, PRODUCTION
 
 logger = logging.getLogger(__name__)
 
+# Polymarket 5 dakikalık BTC piyasa slug öneki: btc-updown-5m-<5dk-hizalı-unix>
+POLY_SLUG_PREFIX = "btc-updown-5m-"
+
 
 @dataclass
 class Kline:
@@ -43,6 +46,8 @@ class PolymarketSnapshot:
     down_book_bids: list = field(default_factory=list)
     down_book_asks: list = field(default_factory=list)
     timestamp: float = 0.0
+    window_start: int = 0    # 5dk pencerenin başlangıcı (unix) — resolution için
+    window_end: int = 0      # 5dk pencerenin sonu (unix) — trade bu anda çözülür
 
     @property
     def up_payout(self) -> float:
@@ -71,6 +76,8 @@ class MarketDataService:
 
         # Polymarket data
         self.active_snapshot: Optional[PolymarketSnapshot] = None
+        # 5dk pencere -> o pencere ilk görüldüğündeki BTC fiyatı (resolution için)
+        self.window_open_price: dict[int, float] = {}
 
         # Internal state for kline building
         self._current_kline_start: float = 0.0
@@ -80,6 +87,28 @@ class MarketDataService:
     # ------------------------------------------------------------------ #
     #  Binance WebSocket — real-time BTC/USDT trades + kline building     #
     # ------------------------------------------------------------------ #
+
+    def bootstrap_klines(self, limit: int = 60):
+        """
+        Başlangıçta Binance REST'ten geçmiş 1dk mumları çekip klines_1m'i doldurur.
+        Böylece TA stratejileri (RSI/EMA/VWAP/Bollinger) ~20 dk beklemeden ANINDA
+        çalışır. Son (tamamlanmamış) mum atlanır.
+        """
+        try:
+            import ccxt
+            ex = ccxt.binance({"enableRateLimit": True})
+            raw = ex.fetch_ohlcv("BTC/USDT", timeframe="1m", limit=limit)
+            for ts, o, h, l, c, v in raw[:-1]:  # son mum henüz kapanmadı -> atla
+                self.klines_1m.append(Kline(
+                    timestamp=ts / 1000.0, open=float(o), high=float(h),
+                    low=float(l), close=float(c), volume=float(v),
+                ))
+            if raw:
+                self.latest_btc_price = float(raw[-1][4])
+                self._current_kline_start = int(raw[-1][0] / 1000.0) // 60 * 60
+            logger.info(f"✅ {len(self.klines_1m)} geçmiş 1dk mum yüklendi (Binance REST)")
+        except Exception as e:
+            logger.error(f"Kline bootstrap hatası: {e}")
 
     async def binance_ws_loop(self):
         """Stream BTC/USDT trades from Binance and build 1-min klines."""
@@ -198,116 +227,108 @@ class MarketDataService:
     #  Polymarket data                                                    #
     # ------------------------------------------------------------------ #
 
+    def _current_market_slugs(self) -> list[str]:
+        """
+        Aktif 5 dakikalık BTC piyasasının slug'ını HESAPLAR (sayfa sayfa tarama yok).
+
+        Polymarket her 5 dakikada 'btc-updown-5m-<timestamp>' açar; timestamp,
+        pencerenin başlangıcı olan 5-dakikaya hizalı Unix zamanıdır. Şu anki
+        pencereyi (canlı) ve bir sonrakini (yedek) döndürür.
+        """
+        now = int(time.time())
+        base = now - (now % 300)  # şu anki 5-dk sınırı
+        return [f"{POLY_SLUG_PREFIX}{base}", f"{POLY_SLUG_PREFIX}{base + 300}"]
+
     async def fetch_polymarket_data(self):
-        """Fetch the currently active BTC 5m market and its order book from Polymarket."""
+        """Hesaplanan slug ile aktif BTC 5m piyasasını bulur ve fiyat/order book çeker."""
         try:
-            target = None
+            slugs = self._current_market_slugs()
 
-            # Method 1: Try to get the event directly by URL (the user's link)
+            # 1) Hesaplanan slug ile doğrudan bul (anlık)
+            events: list = []
             try:
-                event = await self.client.get_event(
-                    url="https://polymarket.com/event/btc-updown-5m"
-                )
-                if event and hasattr(event, 'markets') and event.markets:
-                    for m in event.markets:
-                        if not getattr(m, 'closed', True):
-                            target = m
-                            break
-                    if target is None:
-                        target = event.markets[0]
-            except Exception:
-                pass
+                pag = self.client.list_events(slug=slugs, closed=False)
+                async for page in pag:
+                    events = list(page.items or [])
+                    break
+            except Exception as e:
+                logger.debug(f"list_events(slug) failed: {e}")
 
-            # Method 2: Search for BTC Up/Down markets
-            if target is None:
+            # 2) Yedek: arama motoru (slug eşleşmesiyle)
+            if not events:
                 try:
-                    search_pag = self.client.search(q="BTC Up/Down 5m", page_size=10)
-                    async for page in search_pag:
-                        if hasattr(page, 'events'):
-                            for ev in page.events:
-                                title = (getattr(ev, 'title', '') or '').lower()
-                                if ('btc' in title or 'bitcoin' in title) and ('5m' in title or '5 min' in title or 'up' in title):
-                                    if hasattr(ev, 'markets') and ev.markets:
-                                        target = ev.markets[0]
-                                        break
-                        if hasattr(page, 'markets'):
-                            for m in page.markets:
-                                q = (getattr(m, 'question', '') or '').lower()
-                                if ('btc' in q or 'bitcoin' in q) and ('5m' in q or '5 min' in q or 'up' in q):
-                                    target = m
-                                    break
+                    pag = self.client.search(q="Bitcoin Up or Down 5m", page_size=10)
+                    async for page in pag:
+                        for sr in (page.items or []):
+                            for ev in (getattr(sr, "events", None) or []):
+                                if (getattr(ev, "slug", "") or "") in slugs:
+                                    events.append(ev)
                         break
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"search fallback failed: {e}")
 
-            # Method 3: List events with BTC filter
-            if target is None:
-                try:
-                    paginator = self.client.list_events(
-                        title_search="BTC Up", live=True, page_size=20
-                    )
-                    async for page in paginator:
-                        for event in page.items:
-                            title = (event.title or "").lower()
-                            if "5m" in title or "up/down" in title or "up or down" in title:
-                                if hasattr(event, 'markets') and event.markets:
-                                    target = event.markets[0]
-                                else:
-                                    target = event
-                                break
-                        break
-                except Exception:
-                    pass
-
-            if target is None:
-                logger.debug("No active BTC 5m markets found this cycle.")
+            if not events:
+                logger.debug("Aktif BTC 5m piyasası bulunamadı (bu döngü).")
                 return
 
+            # Şu anki pencereyi tercih et (slugs[0]); yoksa ilk bulunanı al
+            by_slug = {getattr(e, "slug", ""): e for e in events}
+            target_ev = next((by_slug[s] for s in slugs if s in by_slug), events[0])
 
-            # Get order book data for the target market
-            market_id = str(target.id)
-            question = getattr(target, "question", getattr(target, "title", "BTC 5m"))
+            market = (getattr(target_ev, "markets", None) or [None])[0]
+            if market is None:
+                logger.debug("Event'te market yok.")
+                return
 
-            # Get token IDs — markets have two outcomes
-            tokens = getattr(target, "clob_token_ids", None)
-            if tokens and len(tokens) >= 2:
-                up_token = tokens[0]
-                down_token = tokens[1]
-            else:
-                # Try to get from market directly
-                up_token = getattr(target, "token_id", "")
-                down_token = ""
+            # Token ID'ler event listesinde gelmez -> tam market'i çek (outcomes.yes/no)
+            full = await self.client.get_market(id=market.id)
+            outs = getattr(full, "outcomes", None)
+            if outs is None or not (hasattr(outs, "yes") and hasattr(outs, "no")):
+                logger.debug("Market outcomes eksik.")
+                return
+            up_token = outs.yes.token_id    # 'Up'
+            down_token = outs.no.token_id   # 'Down'
 
-            # Get midpoint prices (implied probabilities)
-            up_price = 0.50
-            down_price = 0.50
+            # Pencereyi slug'dan türet (btc-updown-5m-<W>) -> resolution için
+            slug = getattr(target_ev, "slug", "") or ""
             try:
-                if up_token:
-                    from decimal import Decimal
-                    mid = await self.client.get_midpoint(token_id=up_token)
-                    up_price = float(mid)
-                    down_price = 1.0 - up_price
-            except Exception as e:
-                logger.debug(f"Could not fetch midpoint: {e}")
+                window_start = int(slug.rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                now_i = int(time.time())
+                window_start = now_i - (now_i % 300)
+            window_end = window_start + 300
+            # Pencere ilk görüldüğündeki BTC fiyatını kaydet (dönüş kıyası için)
+            if window_start not in self.window_open_price and self.latest_btc_price > 0:
+                self.window_open_price[window_start] = self.latest_btc_price
+            # Eski pencereleri buda (bellek): 1 saatten eski
+            cutoff = int(time.time()) - 3600
+            self.window_open_price = {
+                w: p for w, p in self.window_open_price.items() if w >= cutoff
+            }
 
-            # Get order books
-            up_bids, up_asks = [], []
-            down_bids, down_asks = [], []
+            # Midpoint (implied probability)
+            up_price, down_price = 0.50, 0.50
             try:
-                if up_token:
-                    book = await self.client.get_order_book(token_id=up_token)
-                    up_bids = [(float(l.price), float(l.size)) for l in book.bids]
-                    up_asks = [(float(l.price), float(l.size)) for l in book.asks]
-                if down_token:
-                    book = await self.client.get_order_book(token_id=down_token)
-                    down_bids = [(float(l.price), float(l.size)) for l in book.bids]
-                    down_asks = [(float(l.price), float(l.size)) for l in book.asks]
+                up_price = float(await self.client.get_midpoint(token_id=up_token))
+                down_price = float(await self.client.get_midpoint(token_id=down_token))
             except Exception as e:
-                logger.debug(f"Could not fetch order book: {e}")
+                logger.debug(f"midpoint fetch failed: {e}")
+
+            # Order book'lar (her iki outcome için)
+            up_bids, up_asks, down_bids, down_asks = [], [], [], []
+            try:
+                ob = await self.client.get_order_book(token_id=up_token)
+                up_bids = [(float(l.price), float(l.size)) for l in ob.bids]
+                up_asks = [(float(l.price), float(l.size)) for l in ob.asks]
+                ob2 = await self.client.get_order_book(token_id=down_token)
+                down_bids = [(float(l.price), float(l.size)) for l in ob2.bids]
+                down_asks = [(float(l.price), float(l.size)) for l in ob2.asks]
+            except Exception as e:
+                logger.debug(f"order book fetch failed: {e}")
 
             self.active_snapshot = PolymarketSnapshot(
-                market_id=market_id,
-                question=question,
+                market_id=str(market.id),
+                question=getattr(target_ev, "title", "BTC 5m"),
                 up_token_id=up_token,
                 down_token_id=down_token,
                 up_price=up_price,
@@ -317,10 +338,12 @@ class MarketDataService:
                 down_book_bids=down_bids,
                 down_book_asks=down_asks,
                 timestamp=time.time(),
+                window_start=window_start,
+                window_end=window_end,
             )
             logger.info(
-                f"📊 Polymarket snapshot: UP=${up_price:.2f} DOWN=${down_price:.2f} | "
-                f"Q: {question}"
+                f"📊 Polymarket: {getattr(target_ev, 'slug', '?')} | "
+                f"UP=${up_price:.2f} DOWN=${down_price:.2f}"
             )
 
         except Exception as e:
@@ -332,6 +355,8 @@ class MarketDataService:
 
     async def start(self):
         """Start all data collection loops."""
+        # Önce geçmiş mumları yükle -> stratejiler beklemeden çalışsın
+        await asyncio.to_thread(self.bootstrap_klines, 60)
         asyncio.create_task(self.binance_ws_loop())
         while True:
             await self.fetch_polymarket_data()

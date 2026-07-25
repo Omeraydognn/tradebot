@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class VWAPReversionStrategy(BaseStrategy):
     def __init__(self, data: MarketDataService, paper: PaperTrader):
         super().__init__(name="VWAP Mean Reversion", data=data, paper=paper)
-        self.deviation_threshold = 0.0015  # 0.15% deviation triggers signal
+        self.deviation_threshold = 0.0005  # 0.05% deviation triggers signal (daha sık)
 
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
         vwap = self.data.calc_vwap(20)

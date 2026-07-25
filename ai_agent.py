@@ -17,7 +17,7 @@ from typing import Optional
 from strategies.base import BaseStrategy, Signal
 from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, GEMINI_MODEL, AI_MIN_INTERVAL_SEC, ADAPT_EVERY_N_TRADES
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,10 @@ class AIAgent:
         self.decision_history: list[dict] = []
         self.total_ai_calls: int = 0
         self.ai_overrides: int = 0
+        self._last_ai_call: float = 0.0  # kota-dostu cooldown için
+        # Adaptasyon (outcome'lardan öğrenme)
+        self.adaptations: list[dict] = []
+        self._trades_at_last_adapt: int = 0
 
         if self.ai_enabled:
             try:
@@ -69,11 +73,14 @@ class AIAgent:
         if decision is None:
             return None
 
-        # If AI is enabled and we got a signal, ask the AI to review
+        # If AI is enabled and we got a signal, ask the AI to review.
+        # Kota dostu: ajan başına en az AI_MIN_INTERVAL_SEC aralıkla çağır.
         if self.ai_enabled and decision.get("action") == "TRADE":
-            ai_review = await self._ai_review(decision, snapshot)
-            if ai_review:
-                decision["ai_review"] = ai_review
+            if time.time() - self._last_ai_call >= AI_MIN_INTERVAL_SEC:
+                self._last_ai_call = time.time()
+                ai_review = await self._ai_review(decision, snapshot)
+                if ai_review:
+                    decision["ai_review"] = ai_review
 
         self.decision_history.append(decision)
         if len(self.decision_history) > 50:
@@ -95,6 +102,11 @@ class AIAgent:
             for t in portfolio.trades[-5:]:
                 recent_outcomes.append(f"{t.side}: {t.result} (${t.pnl:+.2f})")
 
+        # Portföy değerlerini önceden hesapla (f-string format spec'inde koşul olmaz)
+        bal = portfolio.balance if portfolio else 0.0
+        wr = portfolio.win_rate if portfolio else 0.0
+        pnl = portfolio.total_pnl if portfolio else 0.0
+
         prompt = f"""You are an AI trading advisor for a Polymarket BTC 5-minute prediction market.
 
 CURRENT MARKET STATE:
@@ -112,9 +124,9 @@ RECENT TRADE OUTCOMES:
 {chr(10).join(recent_outcomes) if recent_outcomes else 'No trades yet'}
 
 PORTFOLIO:
-- Balance: ${portfolio.balance:.2f if portfolio else 0}
-- Win Rate: {portfolio.win_rate:.0f}% if portfolio else 'N/A'
-- Total P&L: ${portfolio.total_pnl:+.2f if portfolio else 0}
+- Balance: ${bal:.2f}
+- Win Rate: {wr:.0f}%
+- Total P&L: ${pnl:+.2f}
 
 Should this trade be executed? Consider:
 1. Is the expected value genuinely positive after fees?
@@ -128,7 +140,7 @@ Respond in JSON format:
             import asyncio
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
-                model="gemini-2.0-flash",
+                model=GEMINI_MODEL,
                 contents=prompt,
             )
             text = response.text.strip()
@@ -153,10 +165,61 @@ Respond in JSON format:
             logger.debug(f"AI review failed: {e}")
             return None
 
+    def maybe_adapt(self):
+        """Yeterli sayıda yeni işlem sonuçlandıysa stratejiyi yeniden ayarlar."""
+        port = self.strategy.paper.portfolios.get(self.strategy.name)
+        if not port:
+            return
+        if port.total_trades - self._trades_at_last_adapt >= ADAPT_EVERY_N_TRADES:
+            self._trades_at_last_adapt = port.total_trades
+            self.adapt()
+
+    def adapt(self):
+        """
+        Outcome'lara göre stratejiyi yeniden ayarlar (kazanmaya odaklı öğrenme):
+          - Kazanıyorsa (son işlemlerde WR yüksek + PnL+) -> daha AGRESİF
+            (bet_size artar, min_ev düşer -> daha çok işlem).
+          - Kaybediyorsa -> daha SEÇİCİ (bet_size düşer, min_ev artar).
+        Parametreler güvenli sınırlarda tutulur.
+        """
+        port = self.strategy.paper.portfolios.get(self.strategy.name)
+        if not port or port.total_trades < 1:
+            return
+
+        recent = port.trades[-6:]
+        wins = sum(1 for t in recent if t.result == "WIN")
+        recent_wr = wins / len(recent) if recent else 0.0
+        recent_pnl = sum((t.pnl or 0.0) for t in recent)
+
+        old_bet, old_ev = self.strategy.bet_size, self.strategy.min_ev
+
+        if recent_wr >= 0.55 and recent_pnl > 0:
+            self.strategy.bet_size = min(self.strategy.bet_size * 1.25, 50.0)
+            self.strategy.min_ev = max(self.strategy.min_ev - 0.01, 0.0)
+            mode = "AGRESİF"
+        elif recent_wr < 0.40 or recent_pnl < 0:
+            self.strategy.bet_size = max(self.strategy.bet_size * 0.70, 2.0)
+            self.strategy.min_ev = min(self.strategy.min_ev + 0.02, 0.15)
+            mode = "SEÇİCİ"
+        else:
+            mode = "STABİL"
+
+        note = (
+            f"{mode}: son {len(recent)} işlem WR={recent_wr:.0%}, PnL=${recent_pnl:+.2f} → "
+            f"bet ${old_bet:.0f}→${self.strategy.bet_size:.0f}, "
+            f"minEV {old_ev:.2f}→{self.strategy.min_ev:.2f}"
+        )
+        self.adaptations.append({"time": time.time(), "mode": mode, "note": note})
+        if len(self.adaptations) > 20:
+            self.adaptations.pop(0)
+        logger.info(f"🧠 [{self.name}] ADAPT {note}")
+
     def get_status(self) -> dict:
         """Return agent status for dashboard."""
         base_status = self.strategy.get_status()
         base_status["ai_enabled"] = self.ai_enabled
         base_status["ai_calls"] = self.total_ai_calls
         base_status["ai_overrides"] = self.ai_overrides
+        base_status["adaptations"] = self.adaptations[-5:]
+        base_status["adaptation_count"] = len(self.adaptations)
         return base_status
