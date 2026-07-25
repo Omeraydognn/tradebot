@@ -35,6 +35,27 @@
             </div>
         </header>
 
+        <!-- Mikroyapı göstergeleri (canlı piyasa sinyalleri) -->
+        <section class="glass-panel micro-panel">
+            <h2>Piyasa Mikroyapısı <span class="muted micro-sub">— 5dk yön tahmininde asıl bilgi taşıyan veriler</span></h2>
+            <div class="micro-grid" id="micro-grid"></div>
+        </section>
+
+        <!-- Öğrenen model — veriden kendi kendine öğrenen katman -->
+        <section class="glass-panel model-panel" id="model-panel">
+            <h2>Öğrenen Model <span class="muted micro-sub">— mikroyapı verisinden kendi kendine öğrenir</span></h2>
+            <div id="model-body"></div>
+        </section>
+
+        <!-- Birleşik equity curve — tüm stratejilerin karşılaştırması -->
+        <section class="glass-panel equity-panel">
+            <h2>Strateji Karşılaştırma <span class="muted micro-sub">— bakiye eğrileri</span></h2>
+            <div class="equity-wrap">
+                <div id="equity-chart"></div>
+                <div class="equity-legend" id="equity-legend"></div>
+            </div>
+        </section>
+
         <!-- Strategy Grid -->
         <section class="strategies-grid" id="strategies-grid">
             <!-- Strategy cards will be injected here by JS -->

@@ -28,6 +28,8 @@ class Trade:
     resolved_at: Optional[float] = None
     market_window: int = 0           # ait olduğu 5dk pencerenin başlangıcı (unix)
     resolve_at: float = 0.0          # bu trade'in çözüleceği zaman (pencere sonu, unix)
+    raw_confidence: float = 0.0      # stratejinin HAM güveni (kalibrasyon için)
+    calibrated_confidence: float = 0.0  # kalibre edilmiş güven (karşılaştırma)
 
     def to_dict(self) -> dict:
         return {
@@ -112,6 +114,8 @@ class PaperTrader:
         bet_amount: float,
         market_window: int = 0,
         resolve_at: float = 0.0,
+        raw_confidence: float = 0.0,
+        calibrated_confidence: float = 0.0,
     ) -> Optional[Trade]:
         """
         Place a paper trade.
@@ -156,6 +160,8 @@ class PaperTrader:
             payout_if_win=payout_if_win,
             market_window=market_window,
             resolve_at=resolve_at,
+            raw_confidence=raw_confidence,
+            calibrated_confidence=calibrated_confidence,
         )
 
         # Deduct cost from balance

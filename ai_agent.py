@@ -9,6 +9,7 @@ Each strategy is wrapped by an AI agent that can:
 Uses Gemini API for intelligence. Falls back to passthrough mode
 if no API key is configured.
 """
+import asyncio
 import time
 import json
 import logging
@@ -176,11 +177,10 @@ Respond in JSON format:
 
     def adapt(self):
         """
-        Outcome'lara göre stratejiyi yeniden ayarlar (kazanmaya odaklı öğrenme):
-          - Kazanıyorsa (son işlemlerde WR yüksek + PnL+) -> daha AGRESİF
-            (bet_size artar, min_ev düşer -> daha çok işlem).
-          - Kaybediyorsa -> daha SEÇİCİ (bet_size düşer, min_ev artar).
-        Parametreler güvenli sınırlarda tutulur.
+        Kural tabanlı hızlı adaptasyon (her zaman çalışır, ücretsiz):
+          - Kazanıyorsa -> daha AGRESİF (bet↑, minEV↓)
+          - Kaybediyorsa -> daha SEÇİCİ (bet↓, minEV↑)
+        AI açıksa ayrıca `ai_tune()` ile derin parametre ayarı denenir.
         """
         port = self.strategy.paper.portfolios.get(self.strategy.name)
         if not port or port.total_trades < 1:
@@ -209,10 +209,105 @@ Respond in JSON format:
             f"bet ${old_bet:.0f}→${self.strategy.bet_size:.0f}, "
             f"minEV {old_ev:.2f}→{self.strategy.min_ev:.2f}"
         )
-        self.adaptations.append({"time": time.time(), "mode": mode, "note": note})
+        self.adaptations.append({"time": time.time(), "mode": mode, "note": note, "by": "kural"})
         if len(self.adaptations) > 20:
             self.adaptations.pop(0)
         logger.info(f"🧠 [{self.name}] ADAPT {note}")
+
+    async def ai_tune(self):
+        """
+        DERİN ADAPTASYON: Gemini, stratejinin işlem geçmişini + mikroyapı
+        bağlamını inceleyip STRATEJİYE ÖZEL eşikleri (RSI seviyeleri, kanal
+        ağırlıkları, dengesizlik eşiği vb.) gerekçeyle değiştirir.
+
+        Model yalnızca `get_tunables()` ile açılan parametreleri, kendi
+        min/max sınırları içinde değiştirebilir — güvenli.
+        """
+        if not self.ai_enabled or not self.client:
+            return
+        port = self.strategy.paper.portfolios.get(self.strategy.name)
+        if not port or port.total_trades < 4:
+            return
+
+        tun = self.strategy.get_tunables()
+        recent = port.trades[-10:]
+        hist = "\n".join(
+            f"- {t.side} @{t.entry_price:.2f} ${t.amount:.0f} -> {t.result} (${(t.pnl or 0):+.2f})"
+            for t in recent
+        )
+        micro = self.strategy.data.microstructure_snapshot()
+        micro_txt = "\n".join(
+            f"- {k}: {v:.5f}" if isinstance(v, (int, float)) else f"- {k}: {v}"
+            for k, v in micro.items() if v is not None
+        )
+        params_txt = "\n".join(
+            f'- {k}: mevcut={v["value"]:.4f}, izin={v["min"]}..{v["max"]} ({v["desc"]})'
+            for k, v in tun.items()
+        )
+
+        prompt = f"""Sen bir kantitatif trading stratejisini optimize eden AI'sın.
+Strateji: {self.strategy.name}
+Piyasa: Polymarket "BTC 5 dakikada yukarı mı aşağı mı" (binary, $1 ödeme).
+
+PERFORMANS:
+- Toplam işlem: {port.total_trades}, kazanma oranı: {port.win_rate:.0f}%
+- Toplam P&L: ${port.total_pnl:+.2f} (başlangıç ${port.balance + abs(port.total_pnl):.0f})
+
+SON İŞLEMLER:
+{hist or 'yok'}
+
+ANLIK PİYASA MİKROYAPISI:
+{micro_txt or 'yok'}
+
+AYARLAYABİLECEĞİN PARAMETRELER:
+{params_txt}
+
+Görev: Kazanma oranını ve P&L'i artırmak için parametreleri ayarla.
+Kurallar:
+- Sadece yukarıdaki parametreleri, izin verilen aralıkta değiştir.
+- Kaybediyorsa daha seçici ol (daha yüksek eşik, daha düşük bahis).
+- Kazanıyorsa dikkatli şekilde daha agresif ol.
+- Değişiklik gereksizse boş bırak.
+
+SADECE JSON döndür:
+{{"changes": {{"param_adi": deger}}, "reasoning": "tek cümle Türkçe gerekçe"}}"""
+
+        try:
+            self.total_ai_calls += 1
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            text = (response.text or "").strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+
+            data = json.loads(text)
+            changes = data.get("changes") or {}
+            if not changes:
+                return
+
+            before = {k: v["value"] for k, v in tun.items()}
+            self.strategy.set_tunables(changes)
+            after = {k: v["value"] for k, v in self.strategy.get_tunables().items()}
+            diff = {k: (before[k], after[k]) for k in after if abs(after[k] - before.get(k, 0)) > 1e-9}
+            if not diff:
+                return
+
+            note = "AI ayarı: " + ", ".join(f"{k} {a:.3f}→{b:.3f}" for k, (a, b) in diff.items())
+            reason = data.get("reasoning", "")
+            self.adaptations.append({
+                "time": time.time(), "mode": "AI", "note": f"{note} — {reason}", "by": "gemini",
+            })
+            if len(self.adaptations) > 20:
+                self.adaptations.pop(0)
+            logger.info(f"🤖 [{self.name}] AI-TUNE {note} | {reason}")
+
+        except Exception as e:
+            logger.debug(f"AI tune başarısız: {e}")
 
     def get_status(self) -> dict:
         """Return agent status for dashboard."""
