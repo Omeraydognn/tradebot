@@ -231,27 +231,34 @@ SADECE JSON döndür:
         """
         if not self.client or not BUDGET.can_spend(purpose):
             return None
-        try:
-            BUDGET.spend()
-            self.total_ai_calls += 1
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            text = (response.text or "").strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-            return json.loads(text)
-        except Exception as e:
-            msg = str(e)
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                BUDGET.mark_exhausted()
-            else:
-                logger.debug(f"LLM çağrısı başarısız ({purpose}): {e}")
-            return None
+
+        # Kotası dolan model olursa sıradakine geç (her modelin kotası ayrı)
+        for _ in range(len(BUDGET.models)):
+            model = BUDGET.current_model()
+            if model is None:
+                return None
+            try:
+                BUDGET.spend(model)
+                self.total_ai_calls += 1
+                response = await asyncio.to_thread(
+                    self.client.models.generate_content,
+                    model=model,
+                    contents=prompt,
+                )
+                text = (response.text or "").strip()
+                if "```json" in text:
+                    text = text.split("```json")[1].split("```")[0].strip()
+                elif "```" in text:
+                    text = text.split("```")[1].split("```")[0].strip()
+                return json.loads(text)
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    BUDGET.mark_model_exhausted(model)
+                    continue  # sıradaki modeli dene
+                logger.debug(f"LLM çağrısı başarısız ({purpose}, {model}): {e}")
+                return None
+        return None
 
     async def ai_initiate(self, snapshot: PolymarketSnapshot) -> Optional[dict]:
         """

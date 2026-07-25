@@ -13,8 +13,19 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 # AI (Gemini)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# 'gemini-2.0-flash' bazı anahtarlarda 429/404 veriyor; 'gemini-flash-latest' stabil.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# Ücretsiz katman MODEL BAŞINA günde ~20 istek verir. Tek model kullanınca
+# kota dakikalar içinde biter. Birden fazla modeli sırayla kullanmak kotayı
+# aşmak değildir — her modelin kendi ayrı kotası vardır ve bu meşrudur.
+# Biri dolunca (429) otomatik olarak sıradakine geçilir.
+GEMINI_MODELS = [
+    m.strip() for m in os.getenv(
+        "GEMINI_MODELS",
+        "gemini-flash-lite-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite,"
+        "gemini-3-flash-preview,gemini-flash-latest",
+    ).split(",") if m.strip()
+]
+# Geriye dönük uyumluluk (tek model bekleyen kodlar için)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", GEMINI_MODELS[0])
 # Kota dostu: her ajan en fazla bu aralıkta bir AI çağrısı yapar (saniye)
 AI_MIN_INTERVAL_SEC = float(os.getenv("AI_MIN_INTERVAL_SEC", "20"))
 
