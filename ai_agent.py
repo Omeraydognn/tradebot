@@ -19,6 +19,7 @@ from strategies.base import BaseStrategy, Signal
 from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
 from config import GEMINI_API_KEY, GEMINI_MODEL, AI_MIN_INTERVAL_SEC, ADAPT_EVERY_N_TRADES
+from personas import get_persona
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +51,24 @@ class AIAgent:
         self.adaptations: list[dict] = []
         self._trades_at_last_adapt: int = 0
 
+        # --- ZİHİN: kişilik + kendi yazdığı tez ---
+        # Her ajan farklı bir ticaret felsefesine sahiptir; aynı veriye bakıp
+        # farklı sonuçlara varırlar. `thesis` ajanın kendi deneyiminden
+        # çıkardığı, zamanla güncellediği kişisel dersidir.
+        self.persona = get_persona(strategy.name)
+        self.thesis: str = ""              # AI kendi yazar (reflect ile güncellenir)
+        self.thesis_updated_at: float = 0.0
+        self.ai_initiated: int = 0          # AI'ın kendi başlattığı işlem sayısı
+        self.reflections: list[dict] = []   # öz-değerlendirme geçmişi
+        self._trades_at_last_reflect: int = 0
+
         if self.ai_enabled:
             try:
                 self.client = genai.Client(api_key=GEMINI_API_KEY)
-                logger.info(f"🤖 AI Agent initialized for '{strategy.name}'")
+                logger.info(
+                    f"🤖 AI Ajan hazır: '{strategy.name}' — "
+                    f"kişilik: {self.persona['title']} (risk: {self.persona['risk']})"
+                )
             except Exception as e:
                 logger.error(f"Failed to init Gemini client: {e}")
                 self.ai_enabled = False
@@ -108,34 +123,49 @@ class AIAgent:
         wr = portfolio.win_rate if portfolio else 0.0
         pnl = portfolio.total_pnl if portfolio else 0.0
 
-        prompt = f"""You are an AI trading advisor for a Polymarket BTC 5-minute prediction market.
+        micro = self.strategy.data.microstructure_snapshot()
+        micro_txt = "\n".join(
+            f"- {k}: {v:.5f}" if isinstance(v, (int, float)) else f"- {k}: {v}"
+            for k, v in micro.items() if v is not None
+        )
+        p = self.persona
 
-CURRENT MARKET STATE:
-- BTC Price: ${self.strategy.data.latest_btc_price:,.2f}
-- Polymarket UP share price: ${snapshot.up_price:.2f} (buy UP for ${snapshot.up_price:.2f}, win $1.00 if correct)
-- Polymarket DOWN share price: ${snapshot.down_price:.2f} (buy DOWN for ${snapshot.down_price:.2f}, win $1.00 if correct)
+        prompt = f"""Sen bir Polymarket "BTC 5 dakikada yukarı mı aşağı mı" piyasasında
+işlem yapan bağımsız bir trader'sın. Bir bot değil, KENDİ GÖRÜŞÜ OLAN bir zihinsin.
 
-STRATEGY SIGNAL ({self.strategy.name}):
-- Direction: {decision['direction']}
-- Confidence: {decision['confidence']:.0%}
-- Expected Value: ${decision['ev']:+.4f}
-- Reasoning: {decision['reasoning']}
+SENİN KİMLİĞİN: {p['title']}
+{p['philosophy']}
+Risk iştahın: {p['risk']}
+Eğilimin: {p['override_bias']}
+Odaklandığın sinyaller: {p['edge_focus']}
 
-RECENT TRADE OUTCOMES:
-{chr(10).join(recent_outcomes) if recent_outcomes else 'No trades yet'}
+SENİN KENDİ TEZİN (geçmiş deneyimlerinden çıkardığın ders):
+{self.thesis or '(henüz yeterli deneyim yok — ilk izlenimlerinle karar ver)'}
 
-PORTFOLIO:
-- Balance: ${bal:.2f}
-- Win Rate: {wr:.0f}%
-- Total P&L: ${pnl:+.2f}
+PİYASA DURUMU:
+- BTC: ${self.strategy.data.latest_btc_price:,.2f}
+- UP hissesi: ${snapshot.up_price:.2f} | DOWN hissesi: ${snapshot.down_price:.2f}
+  (aldığın hisse doğru çıkarsa $1.00 öder; yani $0.40'a alıp kazanırsan $0.60 kâr)
 
-Should this trade be executed? Consider:
-1. Is the expected value genuinely positive after fees?
-2. Does the recent trade history suggest this strategy is working?
-3. Is the share price favorable (risk/reward ratio)?
+MİKROYAPI VERİSİ:
+{micro_txt or '(veri yok)'}
 
-Respond in JSON format:
-{{"approve": true/false, "confidence_adjustment": 0.0, "reasoning": "brief explanation"}}"""
+MEKANİK STRATEJİNİN ÖNERİSİ ({self.strategy.name}):
+- Yön: {decision['direction']}
+- Güven: {decision['confidence']:.0%}
+- Beklenen değer (EV): ${decision['ev']:+.4f}
+- Gerekçe: {decision['reasoning']}
+
+SENİN PERFORMANSIN:
+- Bakiye: ${bal:.2f} | Kazanma oranı: {wr:.0f}% | Toplam P&L: ${pnl:+.2f}
+- Son işlemler: {' | '.join(recent_outcomes) if recent_outcomes else 'henüz yok'}
+
+Mekanik strateji sadece bir ÖNERİDİR. Sen kendi kimliğin, tezin ve piyasa
+verisiyle KENDİ kararını ver. Katılmıyorsan reddet. Kimliğine uygun bir
+fırsat görüyorsan güveni artır.
+
+SADECE JSON döndür:
+{{"approve": true/false, "confidence_adjustment": -0.15..+0.15, "reasoning": "tek cümle, Türkçe, kendi sesinle"}}"""
 
         try:
             import asyncio
@@ -165,6 +195,197 @@ Respond in JSON format:
         except Exception as e:
             logger.debug(f"AI review failed: {e}")
             return None
+
+    async def ai_initiate(self, snapshot: PolymarketSnapshot) -> Optional[dict]:
+        """
+        AI'IN KENDİ İNİSİYATİFİ.
+
+        Mekanik strateji sessiz kaldığında bile, ajan piyasaya kendi
+        kimliğiyle bakar ve bir FIRSAT görürse işlemi kendisi başlatır.
+        Kullanıcının istediği "AI fırsatı gördüğünde alışılmışın dışına
+        çıkar" davranışı burada gerçekleşir.
+
+        Güvenlik: aynı koruma bantları (fiyat aralığı, pencere sonu, tek
+        pozisyon) burada da geçerlidir — AI bunları AŞAMAZ.
+        """
+        if not self.ai_enabled or not self.client:
+            return None
+        if not self.strategy.is_active:
+            return None
+        # Zaten bu pencerede pozisyon varsa yeni fırsat aramaya gerek yok
+        if self.strategy.has_position_in_window(snapshot.window_start):
+            return None
+
+        micro = self.strategy.data.microstructure_snapshot()
+        micro_txt = "\n".join(
+            f"- {k}: {v:.5f}" if isinstance(v, (int, float)) else f"- {k}: {v}"
+            for k, v in micro.items() if v is not None
+        )
+        portfolio = self.strategy.paper.portfolios.get(self.strategy.name)
+        wr = portfolio.win_rate if portfolio else 0.0
+        pnl = portfolio.total_pnl if portfolio else 0.0
+        p = self.persona
+
+        prompt = f"""Sen "{p['title']}" kimliğine sahip bağımsız bir trader'sın.
+{p['philosophy']}
+
+SENİN TEZİN:
+{self.thesis or '(henüz deneyim birikmedi)'}
+
+Şu an mekanik stratejin SESSİZ (sinyal üretmedi). Ama sen kendi gözünle
+bakıyorsun: burada senin kimliğine uygun bir FIRSAT var mı?
+
+PİYASA:
+- BTC: ${self.strategy.data.latest_btc_price:,.2f}
+- UP: ${snapshot.up_price:.2f} | DOWN: ${snapshot.down_price:.2f}
+
+MİKROYAPI:
+{micro_txt or '(veri yok)'}
+
+PERFORMANSIN: kazanma {wr:.0f}%, P&L ${pnl:+.2f}
+
+ÖNEMLİ: İşlem yapmamak da bir karardır ve çoğu zaman DOĞRU karardır.
+Sadece kimliğine gerçekten uyan, net bir fırsat varsa işlem aç.
+Kararsızsan veya sinyal zayıfsa "trade": false de.
+
+SADECE JSON:
+{{"trade": true/false, "direction": "UP" veya "DOWN", "confidence": 0.50-0.75,
+  "reasoning": "tek cümle Türkçe gerekçe"}}"""
+
+        try:
+            self.total_ai_calls += 1
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            text = (response.text or "").strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            d = json.loads(text)
+
+            if not d.get("trade"):
+                return None
+            direction = d.get("direction")
+            if direction not in ("UP", "DOWN"):
+                return None
+            conf = float(d.get("confidence", 0.55))
+            conf = max(0.50, min(0.75, conf))
+            reasoning = d.get("reasoning", "AI inisiyatifi")
+
+            # Stratejinin normal işlem hattından geçir — koruma bantları korunur
+            decision = self.strategy.execute_ai_signal(
+                snapshot, direction, conf, f"🤖 AI inisiyatifi: {reasoning}"
+            )
+            if decision and decision.get("action") == "TRADE":
+                self.ai_initiated += 1
+                logger.info(
+                    f"💡 [{self.name}] AI KENDİ BAŞLATTI: {direction} "
+                    f"(güven {conf:.0%}) — {reasoning}"
+                )
+            return decision
+
+        except Exception as e:
+            logger.debug(f"AI inisiyatif başarısız: {e}")
+            return None
+
+    async def reflect(self, leaderboard: Optional[list] = None):
+        """
+        ÖZ-DEĞERLENDİRME: Ajan kendi işlem geçmişine bakıp KENDİ TEZİNİ yazar.
+
+        Bu, sistemin gerçek öğrenme döngüsüdür: ajan neyin işe yarayıp
+        yaramadığını doğal dille kendi kelimeleriyle çıkarır ve bu tez
+        sonraki tüm kararlarına girdi olur. Ayrıca liderlik tablosunu
+        görür — rakiplerinden ders çıkarabilir (rekabet).
+        """
+        if not self.ai_enabled or not self.client:
+            return
+        portfolio = self.strategy.paper.portfolios.get(self.strategy.name)
+        if not portfolio or portfolio.total_trades < 5:
+            return
+
+        trades = portfolio.trades[-15:]
+        hist = "\n".join(
+            f"- {t.side} @{t.entry_price:.2f} ${t.amount:.0f} -> {t.result} (${(t.pnl or 0):+.2f})"
+            for t in trades
+        )
+        cal = self.strategy.calibrator.to_dict()
+        lb_txt = ""
+        if leaderboard:
+            lb_txt = "\n".join(
+                f"- {r['name']}: P&L ${r['total_pnl']:+.2f}, kazanma {r['win_rate']:.0f}%"
+                for r in leaderboard[:5]
+            )
+        p = self.persona
+
+        prompt = f"""Sen "{p['title']}" kimliğine sahip bir trader'sın.
+{p['philosophy']}
+
+Şimdi kendi performansını dürüstçe değerlendireceksin.
+
+İŞLEM GEÇMİŞİN (son {len(trades)}):
+{hist}
+
+GENEL: {portfolio.total_trades} işlem, kazanma {portfolio.win_rate:.0f}%, P&L ${portfolio.total_pnl:+.2f}
+
+KALİBRASYON (dürüstlük ölçümü):
+- Ortalama tahmin ettiğin güven: {cal.get('mean_predicted')}
+- Gerçek isabet oranın: {cal.get('empirical_accuracy')}
+  (tahminin gerçekten yüksekse FAZLA İYİMSERSİN — daha temkinli ol)
+
+RAKİPLERİN (aynı piyasada yarışan diğer zihinler):
+{lb_txt or '(veri yok)'}
+
+Görev: Kendi deneyiminden bir DERS çıkar ve tezini yaz. Bu tez sonraki
+kararlarında sana rehber olacak. Somut ol — "daha dikkatli olacağım" gibi
+boş laf değil, "X koşulunda işlem açmam çünkü Y" gibi işe yarar bir kural.
+Kaybediyorsan bunu kabul et ve yaklaşımını değiştir. Rakibin daha iyiyse
+ondan ne öğrenebileceğini düşün ama kendi kimliğini terk etme.
+
+SADECE JSON:
+{{"thesis": "2-3 cümle, Türkçe, kendi sesinle yazılmış kişisel tezin",
+  "key_lesson": "tek cümle en önemli ders"}}"""
+
+        try:
+            self.total_ai_calls += 1
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            text = (response.text or "").strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            d = json.loads(text)
+
+            new_thesis = (d.get("thesis") or "").strip()
+            if new_thesis:
+                self.thesis = new_thesis
+                self.thesis_updated_at = time.time()
+                self.reflections.append({
+                    "time": time.time(),
+                    "thesis": new_thesis,
+                    "lesson": d.get("key_lesson", ""),
+                    "trades_at": portfolio.total_trades,
+                    "pnl_at": round(portfolio.total_pnl, 2),
+                })
+                if len(self.reflections) > 10:
+                    self.reflections.pop(0)
+                logger.info(f"📝 [{self.name}] tezini güncelledi: {new_thesis[:110]}")
+
+        except Exception as e:
+            logger.debug(f"Reflect başarısız: {e}")
+
+    def maybe_reflect(self, leaderboard=None):
+        """Yeterli yeni işlem biriktiyse öz-değerlendirme gerekir mi?"""
+        portfolio = self.strategy.paper.portfolios.get(self.strategy.name)
+        if not portfolio:
+            return False
+        return portfolio.total_trades - self._trades_at_last_reflect >= 8
 
     def maybe_adapt(self):
         """Yeterli sayıda yeni işlem sonuçlandıysa stratejiyi yeniden ayarlar."""
@@ -317,4 +538,12 @@ SADECE JSON döndür:
         base_status["ai_overrides"] = self.ai_overrides
         base_status["adaptations"] = self.adaptations[-5:]
         base_status["adaptation_count"] = len(self.adaptations)
+        # Zihin: kişilik + kendi yazdığı tez (dashboard'da görünür)
+        base_status["persona"] = {
+            "title": self.persona.get("title"),
+            "risk": self.persona.get("risk"),
+        }
+        base_status["thesis"] = self.thesis
+        base_status["ai_initiated"] = self.ai_initiated
+        base_status["reflections"] = self.reflections[-3:]
         return base_status

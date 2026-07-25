@@ -333,6 +333,15 @@ function renderDashboard(data) {
                         <span class="win-rate-val monospace">${port.win_rate.toFixed(1)}%</span>
                     </div>
                 </div>
+                ${strat.persona ? `
+                <div class="persona-box">
+                    <div class="persona-head">
+                        <span class="persona-title">🧠 ${strat.persona.title}</span>
+                        <span class="muted">risk: ${strat.persona.risk}${strat.ai_initiated ? ` · ${strat.ai_initiated} kendi işlemi` : ''}</span>
+                    </div>
+                    ${strat.thesis ? `<div class="persona-thesis">"${strat.thesis}"</div>`
+                                   : `<div class="persona-thesis muted">Henüz tez yazmadı (deneyim birikiyor…)</div>`}
+                </div>` : ''}
                 <div class="strat-chart">
                     <div class="strat-chart-head">
                         <span>P&L Geçmişi</span>

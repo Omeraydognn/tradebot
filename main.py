@@ -66,7 +66,7 @@ async def strategy_loop(agents: list[AIAgent], data: MarketDataService, paper: P
         # ÖĞRENME her zaman çalışır — Polymarket erişilemese bile model
         # BTC pencerelerinden öğrenmeye devam eder (veri kaybı olmasın).
         try:
-            train_online_model(data, online_model)
+            await train_online_model(data, online_model)
         except Exception as e:
             logger.debug(f"Model eğitim hatası: {e}")
 
@@ -81,24 +81,45 @@ async def strategy_loop(agents: list[AIAgent], data: MarketDataService, paper: P
             await asyncio.sleep(10)
             continue
 
-        # Evaluate all strategies
+        # Mekanik stratejileri değerlendir (AI her birini kendi kimliğiyle inceler)
+        silent_agents = []
         for agent in agents:
             try:
-                await agent.evaluate(snapshot)
+                decision = await agent.evaluate(snapshot)
+                if decision is None:
+                    silent_agents.append(agent)
             except Exception as e:
                 logger.error(f"Error in {agent.name}: {e}")
 
-        # Resolution: her trade KENDİ 5dk penceresinin sonunda, o penceredeki
-        # gerçek BTC hareketine (açılış vs kapanış) göre çözülür.
-        resolved = resolve_due_trades(data, paper, agents, online_model)
+        # AI İNİSİYATİFİ: stratejisi sessiz kalan ajanlar piyasaya KENDİ
+        # gözleriyle bakar; kimliğine uyan bir fırsat görürse işlemi kendisi
+        # başlatır. Kota dostu olsun diye ~1 dakikada bir ve sırayla.
+        if cycle % 6 == 0 and silent_agents:
+            idx = (cycle // 6) % len(silent_agents)
+            try:
+                await silent_agents[idx].ai_initiate(snapshot)
+            except Exception as e:
+                logger.debug(f"AI initiate error: {e}")
+
+        # Resolution: her trade, penceresinin RESMİ (Chainlink tabanlı)
+        # Polymarket çözümüyle kapatılır — Binance tahminiyle değil.
+        resolved = await resolve_due_trades(data, paper, agents, online_model)
 
         # İşlem sonuçlandıysa: ajanlar öğrenip stratejilerini adapte etsin
         if resolved:
+            leaderboard = paper.get_leaderboard()
             for agent in agents:
                 try:
                     agent.maybe_adapt()
+                    # ÖZ-DEĞERLENDİRME: ajan kendi tezini yeniden yazar ve
+                    # rakiplerinin sonuçlarını görür (rekabetten öğrenme)
+                    if agent.maybe_reflect():
+                        await agent.reflect(leaderboard)
+                        agent._trades_at_last_reflect = (
+                            paper.portfolios[agent.strategy.name].total_trades
+                        )
                 except Exception as e:
-                    logger.error(f"Adapt error in {agent.name}: {e}")
+                    logger.error(f"Adapt/reflect error in {agent.name}: {e}")
 
         # Her ~10 dakikada bir DERİN AI ayarı (Gemini strateji eşiklerini optimize eder)
         if cycle % 60 == 0:
@@ -115,12 +136,18 @@ async def strategy_loop(agents: list[AIAgent], data: MarketDataService, paper: P
         await asyncio.sleep(10)
 
 
-def resolve_due_trades(data: MarketDataService, paper: PaperTrader,
-                       agents: list, online_model) -> int:
+async def resolve_due_trades(data: MarketDataService, paper: PaperTrader,
+                             agents: list, online_model) -> int:
     """
-    Zamanı gelen trade'leri gerçek sonuçla çözer; ayrıca:
+    Zamanı gelen trade'leri RESMİ sonuçla çözer; ayrıca:
       - Her stratejinin KALİBRATÖRÜNÜ besler (ham güven vs gerçek sonuç)
       - ONLINE MODELİ eğitir (pencere başı mikroyapı -> gerçek yön)
+
+    FİYAT KAYNAĞI (kritik):
+      Bu piyasalar Chainlink BTC/USD ile çözülür, Binance ile değil. Ölçtük:
+      Binance kıyası pencerelerin ~%8'inde yanlış sonuç veriyor. Bu yüzden
+      SADECE Polymarket'in resmi çözümü kullanılır. Sonuç henüz gelmediyse
+      trade bekletilir (yanlış sonuçla kapatmaktansa beklemek yeğdir).
 
     Çözülen trade sayısını döndürür.
     """
@@ -133,25 +160,21 @@ def resolve_due_trades(data: MarketDataService, paper: PaperTrader,
             if not trade.resolve_at or now < trade.resolve_at:
                 continue
 
-            outcome = None
-            source = ""
-
-            # 1) ÖNCELİK: Piyasanın kendi kararı. Pencere kapanırken UP fiyatı
-            #    1'e yakınsa UP, 0'a yakınsa DOWN kazanmıştır.
-            last_up = data.window_last_up_price.get(trade.market_window)
-            if last_up is not None and (last_up >= 0.85 or last_up <= 0.15):
-                outcome = "UP" if last_up >= 0.85 else "DOWN"
-                source = f"piyasa (UP={last_up:.2f})"
-
-            # 2) YEDEK: Pencere açılış/kapanış BTC fiyatı kıyası
+            # TEK DOĞRU KAYNAK: Polymarket'in resmi (Chainlink tabanlı) çözümü
+            outcome = await data.fetch_official_outcome(trade.market_window)
             if outcome is None:
-                open_price = data.window_open_price.get(trade.market_window)
-                close_price = data.kline_open_at(trade.market_window + 300) or data.latest_btc_price
-                if not open_price or not close_price:
-                    continue  # veri yok, bir sonraki turda tekrar dene
-                outcome = "UP" if close_price >= open_price else "DOWN"
-                source = f"fiyat ${open_price:,.0f}→${close_price:,.0f}"
+                # Henüz çözülmemiş. Çok uzun sürerse (>30dk) vazgeçip iptal et,
+                # ama ASLA tahminî bir sonuçla kapatma.
+                if now - trade.resolve_at > 1800:
+                    portfolio.pending_trades.remove(trade)
+                    logger.warning(
+                        f"⚠️  [{trade.strategy_name}] pencere {trade.market_window} "
+                        f"30dk+ çözülmedi — işlem iptal edildi (bakiye iade)."
+                    )
+                    portfolio.balance += trade.amount + trade.fee
+                continue
 
+            source = "resmi (Chainlink)"
             paper.resolve_trade(trade, outcome)
             resolved += 1
 
@@ -168,14 +191,17 @@ def resolve_due_trades(data: MarketDataService, paper: PaperTrader,
     return resolved
 
 
-def train_online_model(data: MarketDataService, online_model) -> int:
+async def train_online_model(data: MarketDataService, online_model) -> int:
     """
-    ONLINE MODEL EĞİTİMİ — Polymarket'ten BAĞIMSIZ çalışır.
+    ONLINE MODEL EĞİTİMİ.
 
     Kapanmış her 5dk penceresi için:
         girdi  = pencere BAŞINDA dondurulmuş mikroyapı (ileriye bakış yok)
-        hedef  = BTC gerçekte yukarı mı kapandı
-    Böylece Polymarket erişilemezken bile model öğrenmeye devam eder.
+        hedef  = piyasanın RESMİ sonucu (Chainlink tabanlı)
+
+    Etiket kalitesi kritik: Binance kıyasıyla üretilen etiketlerin ~%8'i
+    yanlıştı; model bozuk etiketle öğrenirse hiçbir zaman gerçek sinyali
+    bulamaz. Bu yüzden yalnızca resmi sonuç kullanılır.
     """
     now = int(time.time())
     current_window = now - (now % 300)
@@ -185,10 +211,17 @@ def train_online_model(data: MarketDataService, online_model) -> int:
         if w >= current_window:
             continue  # pencere henüz kapanmadı
         micro = data.window_micro.get(w)
-        went_up = _window_went_up(data, w)
-        if not micro or went_up is None:
-            data.window_micro.pop(w, None)   # etiketlenemiyor, at
+        if not micro:
+            data.window_micro.pop(w, None)
             continue
+
+        outcome = await data.fetch_official_outcome(w)
+        if outcome is None:
+            # Henüz çözülmedi; 30dk'dan eskiyse artık gelmeyecek, at.
+            if now - (w + 300) > 1800:
+                data.window_micro.pop(w, None)
+            continue
+        went_up = (outcome == "UP")
 
         online_model.update(micro, went_up)
         learned += 1
@@ -205,16 +238,6 @@ def train_online_model(data: MarketDataService, online_model) -> int:
     return learned
 
 
-def _window_went_up(data: MarketDataService, window_start: int):
-    """Bir pencere yukarı mı kapandı? (model etiketi) — bilinemiyorsa None."""
-    last_up = data.window_last_up_price.get(window_start)
-    if last_up is not None and (last_up >= 0.85 or last_up <= 0.15):
-        return last_up >= 0.85
-    open_p = data.window_open_price.get(window_start)
-    close_p = data.kline_open_at(window_start + 300)
-    if open_p and close_p:
-        return close_p >= open_p
-    return None
 
 
 async def main():

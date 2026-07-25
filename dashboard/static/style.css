@@ -366,6 +366,31 @@ td {
     padding: 12px 0;
 }
 
+/* AI kişiliği + kendi yazdığı tez */
+.persona-box {
+    background: rgba(124, 58, 237, 0.08);
+    border: 1px solid rgba(124, 58, 237, 0.25);
+    border-radius: 8px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+.persona-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.75rem;
+}
+.persona-title { font-weight: 600; color: #c4b5fd; }
+.persona-thesis {
+    font-size: 0.74rem;
+    line-height: 1.45;
+    color: var(--text-main);
+    font-style: italic;
+}
+.persona-thesis.muted { color: var(--text-muted); font-style: normal; }
+
 /* P&L sparkline + adaptasyon */
 .strat-chart { display: flex; flex-direction: column; gap: 6px; }
 .strat-chart-head {
