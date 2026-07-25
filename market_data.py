@@ -131,27 +131,70 @@ class MarketDataService:
     #  Binance WebSocket — real-time BTC/USDT trades + kline building     #
     # ------------------------------------------------------------------ #
 
+    # Bazı bulut sağlayıcıların (Render, AWS, GCP…) IP aralıkları Binance'in
+    # ana domainlerinde (stream.binance.com, api.binance.com) HTTP 451 ile
+    # engellenebiliyor — coğrafi bölgeden bağımsız, IP itibarına dayalı bir
+    # blok. Binance bu durum için RESMİ mirror domainler sağlıyor; birincisi
+    # engellenirse otomatik olarak ikinciye geçilir.
+    SPOT_WS_HOSTS = ["stream.binance.com:9443", "data-stream.binance.vision"]
+    SPOT_REST_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
+
     def bootstrap_klines(self, limit: int = 60):
         """
         Başlangıçta Binance REST'ten geçmiş 1dk mumları çekip klines_1m'i doldurur.
         Böylece TA stratejileri (RSI/EMA/VWAP/Bollinger) ~20 dk beklemeden ANINDA
         çalışır. Son (tamamlanmamış) mum atlanır.
+
+        Ana domain (api.binance.com) engelliyse otomatik olarak Binance'in
+        resmi mirror'ına (data-api.binance.vision) düşer.
         """
-        try:
-            import ccxt
-            ex = ccxt.binance({"enableRateLimit": True})
-            raw = ex.fetch_ohlcv("BTC/USDT", timeframe="1m", limit=limit)
-            for ts, o, h, l, c, v in raw[:-1]:  # son mum henüz kapanmadı -> atla
-                self.klines_1m.append(Kline(
-                    timestamp=ts / 1000.0, open=float(o), high=float(h),
-                    low=float(l), close=float(c), volume=float(v),
-                ))
-            if raw:
-                self.latest_btc_price = float(raw[-1][4])
-                self._current_kline_start = int(raw[-1][0] / 1000.0) // 60 * 60
-            logger.info(f"✅ {len(self.klines_1m)} geçmiş 1dk mum yüklendi (Binance REST)")
-        except Exception as e:
-            logger.error(f"Kline bootstrap hatası: {e}")
+        import urllib.request
+
+        for i, base in enumerate(self.SPOT_REST_HOSTS):
+            try:
+                url = f"{base}/api/v3/klines?symbol=BTCUSDT&interval=1m&limit={limit}"
+                with urllib.request.urlopen(url, timeout=10) as r:
+                    raw = json.loads(r.read().decode())
+                for row in raw[:-1]:  # son mum henüz kapanmadı -> atla
+                    ts, o, h, l, c, v = row[0], row[1], row[2], row[3], row[4], row[5]
+                    self.klines_1m.append(Kline(
+                        timestamp=ts / 1000.0, open=float(o), high=float(h),
+                        low=float(l), close=float(c), volume=float(v),
+                    ))
+                if raw:
+                    self.latest_btc_price = float(raw[-1][4])
+                    self._current_kline_start = int(raw[-1][0] / 1000.0) // 60 * 60
+                tag = "" if i == 0 else " (mirror üzerinden)"
+                logger.info(f"✅ {len(self.klines_1m)} geçmiş 1dk mum yüklendi{tag}")
+                return
+            except Exception as e:
+                logger.warning(f"Kline bootstrap ({base}) başarısız: {e}")
+        logger.error("Kline bootstrap: tüm domainler başarısız oldu.")
+
+    async def _connect_spot_ws(self, path: str, label: str):
+        """
+        Spot WS'e bağlanır; ana domain engelliyse (451 vb.) otomatik olarak
+        Binance'in resmi mirror domainine (data-stream.binance.vision) geçer.
+        Hangi host'un çalıştığını hatırlayıp bir sonraki bağlantıda önce onu
+        dener (gereksiz 451 denemesiyle zaman kaybetmemek için).
+        """
+        host_order = list(self.SPOT_WS_HOSTS)
+        while True:
+            for host in host_order:
+                url = f"wss://{host}/ws/{path}"
+                try:
+                    async with websockets.connect(url, ping_interval=20) as ws:
+                        logger.info(f"✅ {label} bağlandı ({host})")
+                        # Bu host çalıştı -> sıradaki denemede önce bunu dene
+                        if host_order[0] != host:
+                            host_order.remove(host)
+                            host_order.insert(0, host)
+                        async for raw in ws:
+                            yield raw
+                except Exception as e:
+                    logger.error(f"{label} hatası ({host}): {e}")
+                    await asyncio.sleep(2)
+            await asyncio.sleep(3)  # tüm hostlar denendi, biraz bekleyip tekrar dene
 
     async def binance_ws_loop(self):
         """
@@ -160,46 +203,36 @@ class MarketDataService:
         `m` alanı = "alıcı maker mı?".  m=True -> agresif taraf SATICI,
         m=False -> agresif taraf ALICI. Bu, gerçek order-flow sinyalidir.
         """
-        url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-        while True:
+        async for raw in self._connect_spot_ws("btcusdt@trade", "Binance WS (trade+CVD)"):
             try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info("✅ Binance WS bağlandı (trade + CVD)")
-                    async for raw in ws:
-                        data = json.loads(raw)
-                        price = float(data["p"])
-                        qty = float(data["q"])
-                        ts = data["T"] / 1000.0  # ms → sec
-                        is_buyer_maker = bool(data.get("m", False))
+                data = json.loads(raw)
+                price = float(data["p"])
+                qty = float(data["q"])
+                ts = data["T"] / 1000.0  # ms → sec
+                is_buyer_maker = bool(data.get("m", False))
 
-                        self.latest_btc_price = price
-                        self.price_history.append((ts, price))
-                        self._update_kline(ts, price, qty)
+                self.latest_btc_price = price
+                self.price_history.append((ts, price))
+                self._update_kline(ts, price, qty)
 
-                        # CVD: agresif alış (+) / agresif satış (-)
-                        signed = -qty if is_buyer_maker else qty
-                        self.trade_flow.append((ts, signed))
+                # CVD: agresif alış (+) / agresif satış (-)
+                signed = -qty if is_buyer_maker else qty
+                self.trade_flow.append((ts, signed))
             except Exception as e:
-                logger.error(f"Binance WS error: {e}. 3s içinde yeniden bağlanılıyor…")
-                await asyncio.sleep(3)
+                logger.debug(f"trade mesajı işlenemedi: {e}")
 
     async def binance_depth_loop(self):
         """Binance spot emir defteri (top-20, 100ms) — anlık arz/talep dengesi."""
-        url = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
-        while True:
+        async for raw in self._connect_spot_ws("btcusdt@depth20@100ms", "Binance depth WS"):
             try:
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    logger.info("✅ Binance depth WS bağlandı (order book)")
-                    async for raw in ws:
-                        d = json.loads(raw)
-                        bids = d.get("bids") or d.get("b") or []
-                        asks = d.get("asks") or d.get("a") or []
-                        self.book_bids = [(float(p), float(q)) for p, q in bids]
-                        self.book_asks = [(float(p), float(q)) for p, q in asks]
-                        self.book_ts = time.time()
+                d = json.loads(raw)
+                bids = d.get("bids") or d.get("b") or []
+                asks = d.get("asks") or d.get("a") or []
+                self.book_bids = [(float(p), float(q)) for p, q in bids]
+                self.book_asks = [(float(p), float(q)) for p, q in asks]
+                self.book_ts = time.time()
             except Exception as e:
-                logger.error(f"Depth WS error: {e}. 5s içinde yeniden…")
-                await asyncio.sleep(5)
+                logger.debug(f"depth mesajı işlenemedi: {e}")
 
     async def binance_futures_loop(self):
         """
