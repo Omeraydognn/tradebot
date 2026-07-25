@@ -13,6 +13,8 @@
     --color-obi: #f59e0b;
     --color-bollinger: #10b981;
     --color-arb: #ef4444;
+    --color-micro: #ec4899;
+    --color-learned: #22d3ee;
 }
 
 * {
@@ -432,7 +434,124 @@ td {
     animation: flashGreen 1s ease;
 }
 
-/* Responsiveness */
+/* ---------- Mikroyapı paneli ---------- */
+.micro-panel h2, .equity-panel h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin-bottom: 14px;
+    color: var(--text-main);
+}
+.micro-sub { font-size: 0.78rem; font-weight: 400; }
+.micro-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 10px;
+}
+.micro-cell {
+    background: rgba(0, 0, 0, 0.22);
+    border-radius: 8px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    cursor: help;
+}
+.micro-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.3px; }
+.micro-val { font-size: 1rem; font-weight: 600; }
+.micro-val.positive { color: var(--up-color); }
+.micro-val.negative { color: var(--down-color); }
+
+/* ---------- Birleşik equity curve ---------- */
+.equity-wrap { display: flex; gap: 18px; align-items: stretch; }
+#equity-chart { flex: 1; min-width: 0; }
+.equity-svg { width: 100%; height: 170px; display: block; }
+.equity-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    justify-content: center;
+    min-width: 210px;
+}
+.legend-item { display: flex; align-items: center; gap: 8px; font-size: 0.8rem; }
+.legend-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.legend-name { flex: 1; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.legend-val { font-weight: 600; }
+.legend-val.positive { color: var(--up-color); }
+.legend-val.negative { color: var(--down-color); }
+
+/* ---------- Toggle butonu / skip / AI review ---------- */
+button.strat-status {
+    border: none;
+    cursor: pointer;
+    font-family: inherit;
+    transition: filter 0.15s ease;
+    color: var(--text-muted);
+}
+button.strat-status:hover { filter: brightness(1.5); }
+button.strat-status.active { color: var(--up-color); }
+
+.skip-reason {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 6px;
+    padding-top: 5px;
+    border-top: 1px dashed rgba(255,255,255,0.08);
+}
+.badge.ai { background: rgba(236, 72, 153, 0.2); color: var(--color-micro); }
+.ai-review {
+    margin-top: 6px;
+    font-size: 0.74rem;
+    padding: 5px 8px;
+    border-radius: 5px;
+    line-height: 1.35;
+}
+.ai-review.ok { background: rgba(16, 185, 129, 0.12); color: var(--up-color); }
+.ai-review.block { background: rgba(239, 68, 68, 0.12); color: var(--down-color); }
+
+/* ---------- Öğrenen model paneli ---------- */
+.model-panel h2 { font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; }
+.model-learning {
+    background: rgba(236, 72, 153, 0.08);
+    border-left: 3px solid var(--color-micro);
+    padding: 12px 14px; border-radius: 8px; font-size: 0.85rem;
+}
+.model-stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px; margin-bottom: 12px;
+}
+.model-stat {
+    background: rgba(0,0,0,0.22); border-radius: 8px; padding: 8px 10px;
+    display: flex; flex-direction: column; gap: 2px;
+}
+.model-verdict {
+    padding: 8px 12px; border-radius: 6px; font-size: 0.85rem;
+    font-weight: 600; margin-bottom: 14px;
+}
+.model-verdict.positive { background: rgba(16,185,129,0.12); color: var(--up-color); }
+.model-verdict.negative { background: rgba(239,68,68,0.10); color: var(--down-color); }
+.feat-title { font-size: 0.78rem; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; }
+.feat-list { display: flex; flex-direction: column; gap: 6px; }
+.feat-row { display: grid; grid-template-columns: 150px 1fr 70px; align-items: center; gap: 10px; font-size: 0.78rem; }
+.feat-name { color: var(--text-muted); }
+.feat-bar { background: rgba(255,255,255,0.07); height: 6px; border-radius: 3px; overflow: hidden; }
+.feat-fill { height: 100%; border-radius: 3px; }
+.feat-fill.positive { background: var(--up-color); }
+.feat-fill.negative { background: var(--down-color); }
+.feat-w { text-align: right; font-weight: 600; }
+.feat-w.positive { color: var(--up-color); }
+.feat-w.negative { color: var(--down-color); }
+
+/* ---------- Kalibrasyon rozeti ---------- */
+.calib {
+    font-size: 0.72rem; color: var(--text-muted);
+    background: rgba(0,0,0,0.2); border-radius: 6px;
+    padding: 6px 8px; margin-top: 6px; line-height: 1.4;
+}
+.calib-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 3px; }
+.calib-row .positive { color: var(--up-color); font-weight: 600; }
+.calib-row .negative { color: var(--down-color); font-weight: 600; }
+
+/* ---------- Responsiveness ---------- */
 @media (max-width: 1200px) {
     .lower-section {
         grid-template-columns: 1fr;
@@ -441,4 +560,26 @@ td {
     .leaderboard-panel, .trades-panel, .feed-panel {
         height: 400px;
     }
+    .equity-wrap { flex-direction: column; }
+    .equity-legend { min-width: 0; flex-direction: row; flex-wrap: wrap; }
+    .legend-item { flex: 0 0 auto; }
+}
+
+@media (max-width: 768px) {
+    body { padding: 10px; }
+    .header { flex-direction: column; align-items: flex-start; gap: 12px; padding: 14px 16px; }
+    .header-title h1 { font-size: 1.15rem; }
+    .header-tickers { flex-direction: column; gap: 12px; width: 100%; }
+    .ticker-box { align-items: flex-start; width: 100%; }
+    .ticker-value { font-size: 1.4rem; }
+    .polymarket-box { border-left: none; padding-left: 0; border-top: 1px solid var(--panel-border); padding-top: 12px; }
+    .strategies-grid { grid-template-columns: 1fr; }
+    .micro-grid { grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); }
+    .micro-val { font-size: 0.88rem; }
+    .glass-panel { padding: 14px; }
+    .equity-svg { height: 130px; }
+    table { font-size: 0.78rem; }
+    th, td { padding: 6px 4px; }
+    .trade-row { grid-template-columns: 40px 1fr auto auto; gap: 6px; font-size: 0.72rem; }
+    .trade-amt { display: none; }
 }

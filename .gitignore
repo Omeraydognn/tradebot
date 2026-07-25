@@ -11,3 +11,7 @@ venv/
 
 # Secrets — asla commit etme
 .env
+
+# Çalışma zamanı durumu
+state.json
+state.json.tmp

@@ -5,7 +5,9 @@ const colors = {
     "VWAP Mean Reversion": "var(--color-vwap)",
     "Order Book Imbalance": "var(--color-obi)",
     "Bollinger Breakout": "var(--color-bollinger)",
-    "Implied Prob. Arbitrage": "var(--color-arb)"
+    "Implied Prob. Arbitrage": "var(--color-arb)",
+    "Microstructure Alpha": "var(--color-micro)",
+    "Learned Alpha": "var(--color-learned)"
 };
 
 // Bir stratejinin işlemlerini (açık + çözülmüş) satır satır render eder.
@@ -70,6 +72,191 @@ function renderSparkline(history, initial) {
 
 let lastData = null;
 
+// ---------- Mikroyapı paneli ----------
+// Her gösterge: etiket, biçim, ve "yukarı mı iyi" yönü (renklendirme için)
+const MICRO_SPEC = [
+    { key: 'cvd_ratio_60s',      label: 'CVD 60s',        fmt: v => (v>=0?'+':'') + v.toFixed(2), signed: true,
+      hint: 'Agresif alış/satış dengesi (+ = alıcılar agresif)' },
+    { key: 'book_imbalance',     label: 'Emir Defteri',   fmt: v => (v>=0?'+':'') + v.toFixed(2), signed: true,
+      hint: 'Binance derinlik dengesizliği (+ = kalın bid)' },
+    { key: 'funding_rate',       label: 'Funding',        fmt: v => (v*100).toFixed(4) + '%', signed: true,
+      hint: 'Perp funding — yüksek = long kalabalık (kontrarian)' },
+    { key: 'basis_pct',          label: 'Basis',          fmt: v => (v>=0?'+':'') + v.toFixed(3) + '%', signed: true,
+      hint: 'Perp primi (mark - spot)' },
+    { key: 'oi_change_5m',       label: 'OI Δ5dk',        fmt: v => (v>=0?'+':'') + v.toFixed(3) + '%', signed: true,
+      hint: 'Açık pozisyon değişimi — kaldıraç birikimi' },
+    { key: 'momentum_5m',        label: 'Momentum 5dk',   fmt: v => (v>=0?'+':'') + v.toFixed(3) + '%', signed: true,
+      hint: 'Son 5 dakikalık fiyat değişimi' },
+    { key: 'tf_alignment',       label: 'TF Uyum',        fmt: v => (v>=0?'+':'') + v.toFixed(2), signed: true,
+      hint: '1/3/5dk momentum aynı yöne mi bakıyor' },
+    { key: 'realized_vol',       label: 'Oynaklık',       fmt: v => v.toFixed(3) + '%', signed: false,
+      hint: 'Gerçekleşen oynaklık (5dk)' },
+    { key: 'spread_bps',         label: 'Spread',         fmt: v => v.toFixed(3) + ' bps', signed: false,
+      hint: 'Binance bid-ask spread' },
+    { key: 'liquidation_flow_5m',label: 'Likidasyon',     fmt: v => (v>=0?'+$':'-$') + Math.abs(v).toLocaleString('en-US',{maximumFractionDigits:0}), signed: true,
+      hint: '+ = short likidasyonu (yukarı itiş)' },
+];
+
+function renderMicro(micro) {
+    const grid = document.getElementById('micro-grid');
+    if (!grid) return;
+    if (!micro || Object.keys(micro).length === 0) {
+        grid.innerHTML = '<div class="muted" style="padding:8px;">Veri toplanıyor…</div>';
+        return;
+    }
+    grid.innerHTML = MICRO_SPEC.map(s => {
+        const v = micro[s.key];
+        if (v === null || v === undefined) {
+            return `<div class="micro-cell" title="${s.hint}">
+                <span class="micro-label">${s.label}</span>
+                <span class="micro-val muted monospace">—</span></div>`;
+        }
+        const cls = s.signed ? (v > 0 ? 'positive' : (v < 0 ? 'negative' : '')) : '';
+        return `<div class="micro-cell" title="${s.hint}">
+            <span class="micro-label">${s.label}</span>
+            <span class="micro-val monospace ${cls}">${s.fmt(v)}</span></div>`;
+    }).join('');
+}
+
+// ---------- Kalibrasyon rozeti (strateji kartında) ----------
+// "Bu strateji %60 dediğinde gerçekten %60 tutturuyor mu?"
+function renderCalibration(c) {
+    if (!c) return '';
+    if (!c.samples) {
+        return `<div class="calib muted">🎯 Kalibrasyon: veri bekleniyor</div>`;
+    }
+    if (!c.active) {
+        return `<div class="calib muted">🎯 Kalibrasyon: ${c.samples}/15 örnek (henüz ham güven kullanılıyor)</div>`;
+    }
+    const pred = c.mean_predicted, act = c.empirical_accuracy;
+    const gap = (pred != null && act != null) ? (act - pred) : null;
+    // Tahmin ile gerçek arasındaki fark küçükse "dürüst" model
+    const cls = gap == null ? '' : (Math.abs(gap) < 0.06 ? 'positive' : 'negative');
+    const label = gap == null ? '' :
+        (Math.abs(gap) < 0.06 ? 'dürüst' : (gap < 0 ? 'fazla iyimser' : 'fazla temkinli'));
+    const brierTxt = c.brier != null
+        ? `Brier ${c.brier.toFixed(3)}${c.brier_calibrated != null ? ' → ' + c.brier_calibrated.toFixed(3) : ''}`
+        : '';
+    return `<div class="calib">
+        🎯 <strong>Kalibrasyon aktif</strong> (${c.samples} örnek)
+        <div class="calib-row">
+            <span>Dediği: <span class="monospace">${pred != null ? (pred*100).toFixed(0)+'%' : '—'}</span></span>
+            <span>Gerçek: <span class="monospace">${act != null ? (act*100).toFixed(0)+'%' : '—'}</span></span>
+            <span class="${cls}">${label}</span>
+        </div>
+        <div class="muted" style="font-size:0.68rem;">${brierTxt} <span style="opacity:.7">(düşük iyi, 0.25=rastgele)</span></div>
+    </div>`;
+}
+
+// ---------- Öğrenen model paneli ----------
+function renderModel(m) {
+    const host = document.getElementById('model-body');
+    if (!host) return;
+    if (!m) { host.innerHTML = '<div class="muted">Model yok.</div>'; return; }
+
+    if (!m.ready) {
+        const need = 25 - (m.n_updates || 0);
+        host.innerHTML = `<div class="model-learning">
+            📚 Öğreniyor… <strong>${m.n_updates || 0}</strong> pencere işlendi.
+            Tahmin vermeye başlamak için <strong>${need > 0 ? need : 0}</strong> pencere daha gerekiyor.
+            <div class="muted" style="margin-top:4px;font-size:0.74rem;">
+                Model, her 5dk penceresinin başındaki mikroyapıdan sonucu öğrenir. Kural yazılmamıştır.
+            </div>
+        </div>`;
+        return;
+    }
+
+    const acc = m.accuracy, ll = m.log_loss, good = m.beats_random;
+    const verdictCls = good ? 'positive' : 'negative';
+    const verdictTxt = good
+        ? 'Rastgeleden İYİ — gerçek öngörü sinyali var'
+        : 'Henüz rastgele seviyesinde — bu yüzden işlem açmıyor';
+
+    const feats = (m.top_features || []).map(f => {
+        const cls = f.weight >= 0 ? 'positive' : 'negative';
+        const w = Math.min(Math.abs(f.weight) / 0.5, 1) * 100;
+        return `<div class="feat-row">
+            <span class="feat-name">${f.feature}</span>
+            <div class="feat-bar"><div class="feat-fill ${cls}" style="width:${w}%"></div></div>
+            <span class="feat-w monospace ${cls}">${f.weight >= 0 ? '+' : ''}${f.weight.toFixed(3)}</span>
+        </div>`;
+    }).join('');
+
+    host.innerHTML = `
+        <div class="model-stats">
+            <div class="model-stat"><span class="micro-label">Öğrenilen Pencere</span>
+                <span class="micro-val monospace">${m.n_updates}</span></div>
+            <div class="model-stat"><span class="micro-label">İsabet</span>
+                <span class="micro-val monospace">${acc != null ? (acc*100).toFixed(1)+'%' : '—'}</span></div>
+            <div class="model-stat"><span class="micro-label">Son 100</span>
+                <span class="micro-val monospace">${m.recent_accuracy != null ? (m.recent_accuracy*100).toFixed(1)+'%' : '—'}</span></div>
+            <div class="model-stat"><span class="micro-label">Log-Loss</span>
+                <span class="micro-val monospace ${verdictCls}">${ll != null ? ll.toFixed(4) : '—'}</span>
+                <span class="muted" style="font-size:0.65rem;">rastgele = 0.693</span></div>
+        </div>
+        <div class="model-verdict ${verdictCls}">${good ? '✅' : '⚠️'} ${verdictTxt}</div>
+        <div class="feat-title">Modelin öğrendiği en etkili sinyaller</div>
+        <div class="feat-list">${feats || '<span class="muted">—</span>'}</div>`;
+}
+
+// ---------- Birleşik equity curve (tüm stratejiler) ----------
+function renderEquityChart(strategies) {
+    const host = document.getElementById('equity-chart');
+    const legend = document.getElementById('equity-legend');
+    if (!host) return;
+
+    const series = (strategies || []).map(s => {
+        const p = s.portfolio || {};
+        const init = p.initial_balance || 1000;
+        const pts = [init, ...((p.balance_history || []).map(h => h[1]))];
+        return { name: s.name, color: colors[s.name] || '#fff', pts, init };
+    }).filter(s => s.pts.length > 0);
+
+    if (series.length === 0) { host.innerHTML = ''; return; }
+
+    const W = 1000, H = 170, pad = 8;
+    const maxLen = Math.max(...series.map(s => s.pts.length), 2);
+    const allVals = series.flatMap(s => s.pts);
+    const min = Math.min(...allVals), max = Math.max(...allVals);
+    const range = (max - min) || 1;
+    const x = i => pad + (maxLen <= 1 ? 0 : (i / (maxLen - 1)) * (W - 2 * pad));
+    const y = v => H - pad - ((v - min) / range) * (H - 2 * pad);
+    const init = series[0].init;
+
+    const paths = series.map(s => {
+        const d = s.pts.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+        return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.8" opacity="0.9"/>`;
+    }).join('');
+
+    host.innerHTML = `<svg class="equity-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+        <line x1="0" y1="${y(init).toFixed(1)}" x2="${W}" y2="${y(init).toFixed(1)}"
+              stroke="rgba(255,255,255,0.2)" stroke-dasharray="4 4" stroke-width="0.8"/>
+        ${paths}
+    </svg>`;
+
+    if (legend) {
+        legend.innerHTML = series.map(s => {
+            const last = s.pts[s.pts.length - 1];
+            const pnl = last - s.init;
+            const cls = pnl >= 0 ? 'positive' : 'negative';
+            return `<div class="legend-item">
+                <span class="legend-dot" style="background:${s.color}"></span>
+                <span class="legend-name">${s.name}</span>
+                <span class="legend-val monospace ${cls}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</span>
+            </div>`;
+        }).join('');
+    }
+}
+
+// ---------- Strateji aç/kapa ----------
+async function toggleStrategy(name) {
+    try {
+        await fetch(`/api/strategy/${encodeURIComponent(name)}/toggle`, { method: 'POST' });
+        fetchData();
+    } catch (e) { console.error('toggle hatası', e); }
+}
+window.toggleStrategy = toggleStrategy;
+
 async function fetchData() {
     try {
         const res = await fetch(API_URL);
@@ -90,6 +277,11 @@ function renderDashboard(data) {
         updateTicker('pm-up-price', data.polymarket.up_price);
         updateTicker('pm-down-price', data.polymarket.down_price);
     }
+
+    // 1b. Mikroyapı, öğrenen model ve birleşik equity curve
+    renderMicro(data.microstructure);
+    renderModel(data.online_model);
+    renderEquityChart(data.strategies);
 
     // 2. Strategies Grid
     const grid = document.getElementById('strategies-grid');
@@ -118,7 +310,9 @@ function renderDashboard(data) {
                         <div class="strat-dot" style="color: ${color}; background-color: ${color}"></div>
                         ${strat.name}
                     </div>
-                    <div class="strat-status ${strat.is_active ? 'active' : ''}">${strat.is_active ? 'ACTIVE' : 'PAUSED'}</div>
+                    <button class="strat-status ${strat.is_active ? 'active' : ''}"
+                            onclick="toggleStrategy('${strat.name.replace(/'/g, "\\'")}')"
+                            title="Stratejiyi durdur/başlat">${strat.is_active ? 'ACTIVE' : 'PAUSED'}</button>
                 </div>
                 <div class="strat-metrics">
                     <div class="metric">
@@ -146,11 +340,13 @@ function renderDashboard(data) {
                     </div>
                     ${renderSparkline(port.balance_history, port.initial_balance)}
                     ${strat.adaptations && strat.adaptations.length ? `<div class="adapt-note">🧠 ${strat.adaptations[strat.adaptations.length-1].note}</div>` : ''}
+                    ${renderCalibration(strat.calibration)}
                 </div>
                 <div class="strat-signal">
                     <div><span class="bold">Last Signal:</span> ${strat.last_signal?.direction || 'N/A'} (Conf: ${strat.last_signal?.confidence?.toFixed(2) || '0'})</div>
                     <div><span class="bold">EV:</span> ${strat.last_ev?.toFixed(3) || '0'}</div>
                     <div style="font-size: 0.75rem; margin-top: 5px; color: var(--text-muted);">${strat.last_signal?.reasoning || ''}</div>
+                    ${strat.last_skip_reason ? `<div class="skip-reason">⏭️ İşlem yok: ${strat.last_skip_reason}</div>` : ''}
                 </div>
                 <div class="strat-trades">
                     <div class="strat-trades-head">
@@ -245,37 +441,61 @@ function renderDashboard(data) {
     const feed = document.getElementById('decision-feed');
     feed.innerHTML = '';
     
-    let allDecisions = [];
+    let allItems = [];
     if (data.strategies) {
         data.strategies.forEach(s => {
-            if(s.recent_decisions) {
-                s.recent_decisions.forEach(d => {
-                    allDecisions.push({ ...d, strategy: s.name });
-                });
-            }
+            // Strateji kararları (+ varsa AI review'ı)
+            (s.recent_decisions || []).forEach(d => {
+                allItems.push({ kind: 'decision', time: d.timestamp || 0, strategy: s.name, d });
+            });
+            // AI adaptasyonları (kural + Gemini ayarları)
+            (s.adaptations || []).forEach(a => {
+                allItems.push({ kind: 'adapt', time: a.time || 0, strategy: s.name, a });
+            });
         });
     }
+    allItems.sort((x, y) => (y.time || 0) - (x.time || 0));  // en yeni önce
 
-    if (allDecisions.length > 0) {
-        allDecisions.forEach((d) => {
+    if (allItems.length > 0) {
+        allItems.slice(0, 30).forEach(item => {
+            const color = colors[item.strategy] || '#ffffff';
             const el = document.createElement('div');
             el.className = 'feed-item';
-            const color = colors[d.strategy] || '#ffffff';
             el.style.borderLeftColor = color;
-            el.innerHTML = `
-                <div class="feed-meta">
-                    <span style="color: ${color}; font-weight: 600;">${d.strategy}</span>
-                    <span>Conf: ${d.confidence?.toFixed(2)} | EV: ${d.ev?.toFixed(3)}</span>
-                </div>
-                <div class="feed-reason">
-                    <strong style="color: ${d.direction === 'UP' ? 'var(--up-color)' : 'var(--down-color)'}">${d.action} ${d.direction}</strong> - 
-                    ${d.reasoning}
-                </div>
-            `;
+
+            if (item.kind === 'adapt') {
+                const isAI = item.a.by === 'gemini';
+                el.innerHTML = `
+                    <div class="feed-meta">
+                        <span style="color:${color}; font-weight:600;">${item.strategy}</span>
+                        <span class="badge ${isAI ? 'ai' : 'pending'}">${isAI ? '🤖 AI AYARI' : '🧠 ADAPTASYON'}</span>
+                    </div>
+                    <div class="feed-reason">${item.a.note || ''}</div>`;
+            } else {
+                const d = item.d;
+                const rev = d.ai_review;
+                const actionCls = d.direction === 'UP' ? 'var(--up-color)' : 'var(--down-color)';
+                let aiHtml = '';
+                if (rev) {
+                    const ok = rev.approve !== false;
+                    aiHtml = `<div class="ai-review ${ok ? 'ok' : 'block'}">
+                        🤖 ${ok ? 'ONAY' : 'RED'}: ${rev.reasoning || ''}</div>`;
+                }
+                el.innerHTML = `
+                    <div class="feed-meta">
+                        <span style="color:${color}; font-weight:600;">${item.strategy}</span>
+                        <span>Conf: ${(d.confidence ?? 0).toFixed(2)} | EV: ${(d.ev ?? 0).toFixed(3)}</span>
+                    </div>
+                    <div class="feed-reason">
+                        <strong style="color:${actionCls}">${d.action} ${d.direction}</strong> — ${d.reasoning || ''}
+                        ${d.skip_reason ? `<div class="muted" style="font-size:0.72rem;margin-top:3px;">⏭️ ${d.skip_reason}</div>` : ''}
+                    </div>
+                    ${aiHtml}`;
+            }
             feed.appendChild(el);
         });
     } else {
-        feed.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding-top: 20px;">No decisions yet</div>';
+        feed.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding-top: 20px;">Henüz karar yok</div>';
     }
 
     lastData = data;

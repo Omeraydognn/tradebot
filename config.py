@@ -20,7 +20,10 @@ AI_MIN_INTERVAL_SEC = float(os.getenv("AI_MIN_INTERVAL_SEC", "20"))
 
 # Paper Trading
 INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "1000.0"))  # $1000 starting balance per strategy
-POLYMARKET_FEE_RATE = 0.0156  # ~1.56% taker fee at 50/50
+# Polymarket CLOB'da açık bir "işlem ücreti" YOKTUR; gerçek maliyet spread'dir
+# (midpoint yerine ask fiyatından alım — bu artık modelleniyor).
+# Yine de küçük bir sürtünme payı bırakmak istersen bunu >0 yap.
+POLYMARKET_FEE_RATE = float(os.getenv("POLYMARKET_FEE_RATE", "0.0"))
 
 # --- İşlem koruma bantları (guardrails) ---
 # Fiyat bu bandın DIŞINDAysa işlem açma (Implied Arb'ın $0.01'e DOWN alıp

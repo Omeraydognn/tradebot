@@ -59,6 +59,22 @@ class PolymarketSnapshot:
         """Profit if you buy DOWN at current price and win."""
         return 1.0 - self.down_price
 
+    def executable_price(self, side: str) -> float:
+        """
+        GERÇEKÇİ yürütme fiyatı: alırken midpoint değil, en iyi ASK ödenir.
+
+        Polymarket'te açık bir "işlem ücreti" yoktur; asıl maliyet spread'dir
+        (mid 0.50 iken ask 0.52 ise gerçek maliyetin %4'ü buradan gelir).
+        Kitap yoksa midpoint'e düşer.
+        """
+        asks = self.up_book_asks if side == "UP" else self.down_book_asks
+        mid = self.up_price if side == "UP" else self.down_price
+        if asks:
+            best_ask = min(p for p, _ in asks)
+            if 0.0 < best_ask < 1.0:
+                return best_ask
+        return mid
+
 
 class MarketDataService:
     """
@@ -76,13 +92,40 @@ class MarketDataService:
 
         # Polymarket data
         self.active_snapshot: Optional[PolymarketSnapshot] = None
-        # 5dk pencere -> o pencere ilk görüldüğündeki BTC fiyatı (resolution için)
+        # 5dk pencere -> o pencerenin açılış BTC fiyatı (resolution için)
         self.window_open_price: dict[int, float] = {}
+        # 5dk pencere -> son görülen Polymarket UP fiyatı (piyasanın kendi kararı)
+        self.window_last_up_price: dict[int, float] = {}
+        # 5dk pencere -> pencere BAŞINDAKİ mikroyapı (online model bunu öğrenir;
+        # ileriye bakış yok: sadece pencere başında bilinen bilgi)
+        self.window_micro: dict[int, dict] = {}
 
         # Internal state for kline building
         self._current_kline_start: float = 0.0
         self._current_kline: Optional[Kline] = None
         self._trade_volume_acc: float = 0.0
+
+        # ---------------- MİKROYAPI / TÜREV VERİLERİ ----------------
+        # Bunlar 5dk yön tahmininde ham fiyattan daha bilgilendiricidir.
+
+        # CVD (Cumulative Volume Delta): agresif alış - agresif satış hacmi.
+        # (ts, signed_qty) — pozitif = agresif alış, negatif = agresif satış
+        self.trade_flow: deque = deque(maxlen=6000)
+
+        # Emir defteri (Binance spot depth20) — anlık arz/talep dengesi
+        self.book_bids: list = []   # [(price, qty), ...] en iyi 20
+        self.book_asks: list = []
+        self.book_ts: float = 0.0
+
+        # Perp türev verileri (Binance futures)
+        self.funding_rate: float = 0.0        # anlık funding (8h)
+        self.mark_price: float = 0.0          # perp mark price
+        self.open_interest: float = 0.0       # açık pozisyon (BTC)
+        self.oi_history: deque = deque(maxlen=120)   # (ts, oi)
+        self.basis: float = 0.0               # (mark - spot)/spot -> perp primi
+
+        # Likidasyonlar (forceOrder) — zorunlu akış, kısa vadeli itici güç
+        self.liquidations: deque = deque(maxlen=400)  # (ts, side, qty_usd)
 
     # ------------------------------------------------------------------ #
     #  Binance WebSocket — real-time BTC/USDT trades + kline building     #
@@ -111,24 +154,122 @@ class MarketDataService:
             logger.error(f"Kline bootstrap hatası: {e}")
 
     async def binance_ws_loop(self):
-        """Stream BTC/USDT trades from Binance and build 1-min klines."""
+        """
+        Binance spot trade akışı: fiyat + 1dk mum + CVD (order flow).
+
+        `m` alanı = "alıcı maker mı?".  m=True -> agresif taraf SATICI,
+        m=False -> agresif taraf ALICI. Bu, gerçek order-flow sinyalidir.
+        """
         url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
         while True:
             try:
-                async with websockets.connect(url) as ws:
-                    logger.info("✅ Connected to Binance WebSocket (btcusdt@trade)")
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    logger.info("✅ Binance WS bağlandı (trade + CVD)")
                     async for raw in ws:
                         data = json.loads(raw)
                         price = float(data["p"])
                         qty = float(data["q"])
                         ts = data["T"] / 1000.0  # ms → sec
+                        is_buyer_maker = bool(data.get("m", False))
 
                         self.latest_btc_price = price
                         self.price_history.append((ts, price))
                         self._update_kline(ts, price, qty)
+
+                        # CVD: agresif alış (+) / agresif satış (-)
+                        signed = -qty if is_buyer_maker else qty
+                        self.trade_flow.append((ts, signed))
             except Exception as e:
-                logger.error(f"Binance WS error: {e}. Reconnecting in 3s…")
+                logger.error(f"Binance WS error: {e}. 3s içinde yeniden bağlanılıyor…")
                 await asyncio.sleep(3)
+
+    async def binance_depth_loop(self):
+        """Binance spot emir defteri (top-20, 100ms) — anlık arz/talep dengesi."""
+        url = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    logger.info("✅ Binance depth WS bağlandı (order book)")
+                    async for raw in ws:
+                        d = json.loads(raw)
+                        bids = d.get("bids") or d.get("b") or []
+                        asks = d.get("asks") or d.get("a") or []
+                        self.book_bids = [(float(p), float(q)) for p, q in bids]
+                        self.book_asks = [(float(p), float(q)) for p, q in asks]
+                        self.book_ts = time.time()
+            except Exception as e:
+                logger.error(f"Depth WS error: {e}. 5s içinde yeniden…")
+                await asyncio.sleep(5)
+
+    async def binance_futures_loop(self):
+        """
+        Perp türev verileri: funding rate + mark price (dolayısıyla basis).
+
+        NOT: fstream WebSocket bazı ağlardan/bölgelerden erişilemiyor (timeout),
+        bu yüzden REST premiumIndex kullanılıyor — daha dayanıklı.
+        Funding 8 saatte bir değiştiği için 20s poll fazlasıyla yeterli.
+        """
+        import urllib.request
+        url = "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"
+        logged = False
+        while True:
+            try:
+                def _fetch():
+                    with urllib.request.urlopen(url, timeout=10) as r:
+                        return json.loads(r.read().decode())
+                d = await asyncio.to_thread(_fetch)
+                self.mark_price = float(d.get("markPrice", 0) or 0)
+                self.funding_rate = float(d.get("lastFundingRate", 0) or 0)
+                if self.latest_btc_price > 0 and self.mark_price > 0:
+                    self.basis = (self.mark_price - self.latest_btc_price) / self.latest_btc_price
+                if not logged:
+                    logger.info("✅ Perp verisi bağlandı (funding + mark price)")
+                    logged = True
+            except Exception as e:
+                logger.debug(f"premiumIndex hatası: {e}")
+            await asyncio.sleep(20)
+
+    async def liquidation_loop(self):
+        """
+        Likidasyon akışı (forceOrder WS). Bazı ağlarda engelli olabilir;
+        erişilemezse sessizce devre dışı kalır (sistem çalışmaya devam eder).
+        """
+        url = "wss://fstream.binance.com/ws/btcusdt@forceOrder"
+        fails = 0
+        while fails < 3:  # 3 denemede olmazsa vazgeç (opsiyonel veri)
+            try:
+                async with websockets.connect(url, ping_interval=20) as ws:
+                    logger.info("✅ Likidasyon akışı bağlandı")
+                    fails = 0
+                    async for raw in ws:
+                        d = json.loads(raw)
+                        o = d.get("o", {})
+                        side = o.get("S", "")          # SELL = long likidasyonu
+                        qty = float(o.get("q", 0) or 0)
+                        px = float(o.get("p", 0) or 0)
+                        self.liquidations.append((time.time(), side, qty * px))
+            except Exception:
+                fails += 1
+                await asyncio.sleep(5)
+        logger.info("ℹ️  Likidasyon akışı erişilemiyor — bu veri olmadan devam ediliyor.")
+
+    async def open_interest_loop(self):
+        """Açık pozisyon (open interest) — kaldıraç birikimini gösterir (REST, 30s)."""
+        import urllib.request
+        url = "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
+        while True:
+            try:
+                def _fetch():
+                    with urllib.request.urlopen(url, timeout=10) as r:
+                        return json.loads(r.read().decode())
+                d = await asyncio.to_thread(_fetch)
+                oi = float(d.get("openInterest", 0) or 0)
+                if oi > 0:
+                    self.open_interest = oi
+                    self.oi_history.append((time.time(), oi))
+            except Exception as e:
+                logger.debug(f"Open interest fetch hatası: {e}")
+            await asyncio.sleep(30)
 
     def _update_kline(self, ts: float, price: float, volume: float):
         """Accumulate trades into 1-minute candles."""
@@ -217,11 +358,171 @@ class MarketDataService:
         std = float(np.std(arr))
         return (middle, middle + std_dev * std, middle - std_dev * std)
 
+    def kline_open_at(self, ts: int) -> Optional[float]:
+        """
+        Verilen unix zamanına denk gelen 1dk mumun AÇILIŞ fiyatı.
+        5dk pencerenin gerçek başlangıç fiyatını hassas belirlemek için kullanılır.
+        """
+        minute = int(ts) // 60 * 60
+        for k in self.klines_1m:
+            if int(k.timestamp) == minute:
+                return float(k.open)
+        # Oluşmakta olan mum da olabilir
+        if self._current_kline and int(self._current_kline.timestamp) == minute:
+            return float(self._current_kline.open)
+        return None
+
     def recent_price_changes(self, seconds: int = 60) -> list[float]:
         """Get price samples from the last N seconds."""
         now = time.time()
         cutoff = now - seconds
         return [p for t, p in self.price_history if t >= cutoff]
+
+    # ------------------------------------------------------------------ #
+    #  MİKROYAPI GÖSTERGELERİ (5dk yön tahmini için asıl bilgi taşıyanlar) #
+    # ------------------------------------------------------------------ #
+
+    def calc_cvd(self, seconds: int = 60) -> Optional[float]:
+        """
+        Cumulative Volume Delta: son N saniyedeki (agresif alış - agresif satış).
+        Pozitif = alıcılar agresif (yukarı baskı). Order-flow'un özü.
+        """
+        if not self.trade_flow:
+            return None
+        cutoff = time.time() - seconds
+        vals = [q for t, q in self.trade_flow if t >= cutoff]
+        if len(vals) < 5:
+            return None
+        return float(sum(vals))
+
+    def calc_cvd_ratio(self, seconds: int = 60) -> Optional[float]:
+        """
+        CVD'nin toplam hacme oranı: -1 (tamamen satış) … +1 (tamamen alış).
+        Ölçekten bağımsız olduğu için eşik koymak kolaydır.
+        """
+        if not self.trade_flow:
+            return None
+        cutoff = time.time() - seconds
+        vals = [q for t, q in self.trade_flow if t >= cutoff]
+        if len(vals) < 5:
+            return None
+        total = sum(abs(v) for v in vals)
+        if total == 0:
+            return None
+        return float(sum(vals) / total)
+
+    def calc_book_imbalance(self, levels: int = 10) -> Optional[float]:
+        """
+        Emir defteri dengesizliği: (bid_hacim - ask_hacim) / toplam.
+        Pozitif = alış tarafı kalın (destek), negatif = satış baskısı.
+        """
+        if not self.book_bids or not self.book_asks:
+            return None
+        if time.time() - self.book_ts > 30:  # bayat veri
+            return None
+        bid_vol = sum(q for _, q in self.book_bids[:levels])
+        ask_vol = sum(q for _, q in self.book_asks[:levels])
+        total = bid_vol + ask_vol
+        if total == 0:
+            return None
+        return float((bid_vol - ask_vol) / total)
+
+    def calc_spread_bps(self) -> Optional[float]:
+        """Bid-ask spread (baz puan). Yüksek spread = likidite düşük/oynak."""
+        if not self.book_bids or not self.book_asks:
+            return None
+        best_bid = self.book_bids[0][0]
+        best_ask = self.book_asks[0][0]
+        mid = (best_bid + best_ask) / 2
+        if mid <= 0:
+            return None
+        return float((best_ask - best_bid) / mid * 10000)
+
+    def calc_liquidation_flow(self, seconds: int = 300) -> Optional[float]:
+        """
+        Net likidasyon akışı ($). SELL emri = LONG likidasyonu (aşağı baskı),
+        BUY emri = SHORT likidasyonu (yukarı baskı).
+        Pozitif dönüş = short'lar likide oluyor (yukarı itiş).
+        """
+        if not self.liquidations:
+            return None
+        cutoff = time.time() - seconds
+        net = 0.0
+        count = 0
+        for t, side, usd in self.liquidations:
+            if t < cutoff:
+                continue
+            count += 1
+            net += usd if side == "BUY" else -usd
+        return float(net) if count else None
+
+    def calc_oi_change(self, seconds: int = 300) -> Optional[float]:
+        """
+        Açık pozisyon değişimi (%). Fiyatla birlikte yorumlanır:
+          OI↑ + fiyat↑ = yeni long'lar (trend güçlü)
+          OI↓ + fiyat↑ = short kapanışı (short squeeze)
+        """
+        if len(self.oi_history) < 2:
+            return None
+        cutoff = time.time() - seconds
+        old = None
+        for t, oi in self.oi_history:
+            if t >= cutoff:
+                old = oi
+                break
+        if old is None or old == 0:
+            return None
+        return float((self.open_interest - old) / old * 100)
+
+    def calc_momentum_pct(self, seconds: int = 60) -> Optional[float]:
+        """Son N saniyedeki yüzde fiyat değişimi."""
+        prices = self.recent_price_changes(seconds)
+        if len(prices) < 5 or prices[0] <= 0:
+            return None
+        return float((prices[-1] - prices[0]) / prices[0] * 100)
+
+    def calc_multi_tf_alignment(self) -> Optional[float]:
+        """
+        Çoklu zaman dilimi momentum uyumu: 1dk/3dk/5dk aynı yöne bakıyor mu?
+        -1 (hepsi aşağı) … +1 (hepsi yukarı). Uyum, tek dilimden güvenilirdir.
+        """
+        m1 = self.calc_momentum_pct(60)
+        m3 = self.calc_momentum_pct(180)
+        m5 = self.calc_momentum_pct(300)
+        vals = [m for m in (m1, m3, m5) if m is not None]
+        if len(vals) < 2:
+            return None
+        score = sum(1 if v > 0 else -1 for v in vals) / len(vals)
+        return float(score)
+
+    def calc_realized_vol(self, seconds: int = 300) -> Optional[float]:
+        """Gerçekleşen oynaklık (%): fiyat örneklerinin std/ortalama."""
+        prices = self.recent_price_changes(seconds)
+        if len(prices) < 10:
+            return None
+        arr = np.array(prices, dtype=float)
+        mean = float(arr.mean())
+        if mean <= 0:
+            return None
+        return float(arr.std() / mean * 100)
+
+    def microstructure_snapshot(self) -> dict:
+        """Tüm mikroyapı göstergelerini tek sözlükte döndürür (AI + dashboard)."""
+        return {
+            "cvd_60s": self.calc_cvd(60),
+            "cvd_ratio_60s": self.calc_cvd_ratio(60),
+            "cvd_ratio_300s": self.calc_cvd_ratio(300),
+            "book_imbalance": self.calc_book_imbalance(10),
+            "spread_bps": self.calc_spread_bps(),
+            "funding_rate": self.funding_rate,
+            "basis_pct": self.basis * 100 if self.basis else 0.0,
+            "oi_change_5m": self.calc_oi_change(300),
+            "liquidation_flow_5m": self.calc_liquidation_flow(300),
+            "momentum_1m": self.calc_momentum_pct(60),
+            "momentum_5m": self.calc_momentum_pct(300),
+            "tf_alignment": self.calc_multi_tf_alignment(),
+            "realized_vol": self.calc_realized_vol(300),
+        }
 
     # ------------------------------------------------------------------ #
     #  Polymarket data                                                    #
@@ -297,13 +598,26 @@ class MarketDataService:
                 now_i = int(time.time())
                 window_start = now_i - (now_i % 300)
             window_end = window_start + 300
-            # Pencere ilk görüldüğündeki BTC fiyatını kaydet (dönüş kıyası için)
-            if window_start not in self.window_open_price and self.latest_btc_price > 0:
-                self.window_open_price[window_start] = self.latest_btc_price
+            # Pencerenin GERÇEK açılış fiyatı: pencere başlangıcındaki 1dk mumun
+            # open değeri (ilk görüldüğü andaki fiyat değil — ~15s sapma olurdu).
+            if window_start not in self.window_open_price:
+                open_px = self.kline_open_at(window_start)
+                if open_px is None and self.latest_btc_price > 0:
+                    open_px = self.latest_btc_price  # yedek
+                if open_px:
+                    self.window_open_price[window_start] = open_px
+                # Pencere başındaki mikroyapıyı dondur (online modelin girdisi)
+                self.window_micro[window_start] = self.microstructure_snapshot()
             # Eski pencereleri buda (bellek): 1 saatten eski
             cutoff = int(time.time()) - 3600
             self.window_open_price = {
                 w: p for w, p in self.window_open_price.items() if w >= cutoff
+            }
+            self.window_last_up_price = {
+                w: p for w, p in self.window_last_up_price.items() if w >= cutoff
+            }
+            self.window_micro = {
+                w: m for w, m in self.window_micro.items() if w >= cutoff
             }
 
             # Midpoint (implied probability)
@@ -313,6 +627,10 @@ class MarketDataService:
                 down_price = float(await self.client.get_midpoint(token_id=down_token))
             except Exception as e:
                 logger.debug(f"midpoint fetch failed: {e}")
+
+            # Piyasanın kendi kararı: pencerenin son UP fiyatı (1'e yakın = UP kazandı).
+            # Fiyat alındıktan SONRA kaydedilmeli.
+            self.window_last_up_price[window_start] = up_price
 
             # Order book'lar (her iki outcome için)
             up_bids, up_asks, down_bids, down_asks = [], [], [], []
@@ -353,11 +671,38 @@ class MarketDataService:
     #  Main loop                                                          #
     # ------------------------------------------------------------------ #
 
+    async def window_tracker_loop(self):
+        """
+        BTC 5dk pencerelerini POLYMARKET'TEN BAĞIMSIZ takip eder.
+
+        Neden ayrı: online model "şu mikroyapıda BTC 5dk sonra yukarı mı
+        gitti?" sorusunu öğrenir — bunun Polymarket ile ilgisi yoktur.
+        Polymarket erişilemezken (bakım, ağ, piyasa arası boşluk) bile
+        model öğrenmeye DEVAM etmeli. Aksi halde değerli veri kaybedilir.
+        """
+        while True:
+            try:
+                now = int(time.time())
+                w = now - (now % 300)   # şu anki 5dk penceresi
+                if w not in self.window_micro:
+                    open_px = self.kline_open_at(w) or self.latest_btc_price
+                    if open_px:
+                        self.window_open_price.setdefault(w, open_px)
+                        self.window_micro[w] = self.microstructure_snapshot()
+            except Exception as e:
+                logger.debug(f"window tracker hatası: {e}")
+            await asyncio.sleep(10)
+
     async def start(self):
-        """Start all data collection loops."""
+        """Tüm veri akışlarını başlatır (spot, depth, futures, OI, Polymarket)."""
         # Önce geçmiş mumları yükle -> stratejiler beklemeden çalışsın
         await asyncio.to_thread(self.bootstrap_klines, 60)
-        asyncio.create_task(self.binance_ws_loop())
+        asyncio.create_task(self.binance_ws_loop())        # fiyat + CVD
+        asyncio.create_task(self.binance_depth_loop())     # emir defteri
+        asyncio.create_task(self.binance_futures_loop())   # funding + mark (REST)
+        asyncio.create_task(self.liquidation_loop())       # likidasyonlar (opsiyonel)
+        asyncio.create_task(self.open_interest_loop())     # açık pozisyon
+        asyncio.create_task(self.window_tracker_loop())    # 5dk pencere takibi (öğrenme için)
         while True:
             await self.fetch_polymarket_data()
             await asyncio.sleep(15)  # refresh Polymarket data every 15s

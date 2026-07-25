@@ -1,17 +1,20 @@
 """
-Strategy 3: Order Book Imbalance (OBI)
+Strategy 3: Order Book Imbalance (OBI) — Binance spot mikroyapı
 
 Finans Temeli:
-  Microstructure teorisine dayalı. Order book'taki alış (bid) ve satış (ask)
-  taraflarındaki hacim dengesizliği, bilgi sahibi trader'ların pozisyon
-  aldığını gösterir ve kısa vadeli fiyat hareketini önceden tahmin edebilir.
+  Market microstructure teorisi: emir defterindeki alış/satış derinliği
+  dengesizliği kısa vadeli fiyat yönünü öngörür. Kalın bid tarafı = destek
+  (yukarı baskı), kalın ask tarafı = direnç (aşağı baskı).
 
-  Polymarket'teki UP/DOWN token'larının order book derinliği karşılaştırılır.
+  ÖNEMLİ DÜZELTME: Eskiden Polymarket'in UP/DOWN kitapları kullanılıyordu;
+  ancak bu iki token tümleyendir (biri diğerinin aynası) — net dengesizlik
+  daima ~0 çıkıyor ve sinyal üretilemiyordu. Artık BINANCE SPOT emir defteri
+  (gerçek BTC arz/talebi) kullanılıyor.
 
 Sinyal:
-  - UP tarafında bid hacmi >> ask hacmi → UP (alıcılar güçlü)
-  - DOWN tarafında bid hacmi >> ask hacmi → DOWN (satıcılar güçlü)
-  - Confidence = dengesizlik oranına dayalı
+  - Bid derinliği >> ask derinliği  → UP
+  - Ask derinliği >> bid derinliği  → DOWN
+  - CVD (agresif akış) aynı yöne bakıyorsa güven artar (teyit)
 """
 import logging
 from typing import Optional
@@ -26,69 +29,57 @@ logger = logging.getLogger(__name__)
 class OrderBookImbalanceStrategy(BaseStrategy):
     def __init__(self, data: MarketDataService, paper: PaperTrader):
         super().__init__(name="Order Book Imbalance", data=data, paper=paper)
-        self.imbalance_threshold = 0.10  # 10% imbalance to trigger (daha sık)
+        self.imbalance_threshold = 0.15  # |imbalance| bu değeri aşarsa sinyal
+        self.depth_levels = 10           # kaç seviye derinlik bakılacak
 
-    def _calc_side_pressure(self, bids: list, asks: list) -> float:
-        """
-        Calculate buy pressure ratio.
-        Returns 0-1 where >0.5 means more buying pressure.
-        """
-        bid_vol = sum(size for _, size in bids[:5])   # top 5 levels
-        ask_vol = sum(size for _, size in asks[:5])
-        total = bid_vol + ask_vol
-        if total == 0:
-            return 0.5
-        return bid_vol / total
+    def get_tunables(self) -> dict:
+        t = super().get_tunables()
+        t["imbalance_threshold"] = {
+            "value": self.imbalance_threshold, "min": 0.05, "max": 0.60,
+            "desc": "sinyal için gereken emir defteri dengesizliği",
+        }
+        return t
 
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
-        # Need order book data
-        if not snapshot.up_book_bids and not snapshot.down_book_bids:
+        imbalance = self.data.calc_book_imbalance(self.depth_levels)
+        if imbalance is None:
             return None
 
-        up_pressure = self._calc_side_pressure(
-            snapshot.up_book_bids, snapshot.up_book_asks
-        )
-        down_pressure = self._calc_side_pressure(
-            snapshot.down_book_bids, snapshot.down_book_asks
-        )
-
-        # Net imbalance: positive = market favors UP
-        # UP pressure high = people want to BUY up tokens = bullish
-        # DOWN pressure high = people want to BUY down tokens = bearish
-        net_imbalance = up_pressure - down_pressure
+        cvd_ratio = self.data.calc_cvd_ratio(60)   # agresif akış teyidi
+        spread = self.data.calc_spread_bps()
 
         indicators = {
-            "up_bid_pressure": round(up_pressure, 3),
-            "down_bid_pressure": round(down_pressure, 3),
-            "net_imbalance": round(net_imbalance, 3),
-            "up_book_depth": len(snapshot.up_book_bids) + len(snapshot.up_book_asks),
-            "down_book_depth": len(snapshot.down_book_bids) + len(snapshot.down_book_asks),
+            "book_imbalance": round(imbalance, 3),
+            "cvd_ratio_60s": round(cvd_ratio, 3) if cvd_ratio is not None else None,
+            "spread_bps": round(spread, 4) if spread is not None else None,
+            "depth_levels": self.depth_levels,
         }
 
-        # Strong buying pressure on UP side
-        if net_imbalance > self.imbalance_threshold:
-            strength = min(net_imbalance / 0.5, 1.0)
-            confidence = 0.52 + (strength * 0.18)
-            confidence = min(confidence, 0.78)
+        if abs(imbalance) < self.imbalance_threshold:
+            return None
 
-            return Signal(
-                direction="UP",
-                confidence=confidence,
-                reasoning=f"Order book favors UP: imbalance={net_imbalance:.2f}",
-                indicators=indicators,
-            )
+        direction = "UP" if imbalance > 0 else "DOWN"
 
-        # Strong buying pressure on DOWN side
-        elif net_imbalance < -self.imbalance_threshold:
-            strength = min(abs(net_imbalance) / 0.5, 1.0)
-            confidence = 0.52 + (strength * 0.18)
-            confidence = min(confidence, 0.78)
+        # Temel güven: dengesizlik büyüklüğüyle orantılı
+        strength = min(abs(imbalance) / 0.6, 1.0)
+        confidence = 0.50 + strength * 0.14
 
-            return Signal(
-                direction="DOWN",
-                confidence=confidence,
-                reasoning=f"Order book favors DOWN: imbalance={net_imbalance:.2f}",
-                indicators=indicators,
-            )
+        # TEYİT: agresif akış (CVD) aynı yöne bakıyorsa güven artar, tersse azalır
+        if cvd_ratio is not None:
+            same_way = (imbalance > 0 and cvd_ratio > 0) or (imbalance < 0 and cvd_ratio < 0)
+            confidence += 0.06 if same_way else -0.08
+            indicators["flow_confirms"] = same_way
 
-        return None
+        confidence = max(0.35, min(confidence, 0.78))
+
+        return Signal(
+            direction=direction,
+            confidence=confidence,
+            reasoning=(
+                f"Binance defteri {'ALIŞ' if imbalance > 0 else 'SATIŞ'} ağırlıklı "
+                f"(imb={imbalance:+.2f}"
+                + (f", CVD={cvd_ratio:+.2f}" if cvd_ratio is not None else "")
+                + ")"
+            ),
+            indicators=indicators,
+        )
