@@ -63,7 +63,14 @@ def create_app(data_service, paper_trader, agents, online_model=None):
         except Exception:
             micro = {}
 
+        try:
+            from ai_budget import BUDGET
+            ai_budget = BUDGET.to_dict()
+        except Exception:
+            ai_budget = {}
+
         return jsonify({
+            "ai_budget": ai_budget,
             "btc_price": round(_data_service.latest_btc_price, 2),
             "timestamp": time.time(),
             "polymarket": polymarket_data,

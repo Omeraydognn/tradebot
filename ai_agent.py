@@ -19,7 +19,8 @@ from strategies.base import BaseStrategy, Signal
 from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
 from config import GEMINI_API_KEY, GEMINI_MODEL, AI_MIN_INTERVAL_SEC, ADAPT_EVERY_N_TRADES
-from personas import get_persona
+from personas import get_persona, local_persona_judgment
+from ai_budget import BUDGET
 
 logger = logging.getLogger(__name__)
 
@@ -83,20 +84,62 @@ class AIAgent:
         if not self.strategy.is_active:
             return None
 
-        # First, get the base strategy's decision
-        decision = self.strategy.evaluate_and_trade(snapshot)
-
-        if decision is None:
+        # 1) Mekanik strateji bir sinyal üretir (henüz işlem AÇILMAZ)
+        signal = self.strategy.generate_signal(snapshot)
+        if signal is None:
             return None
 
-        # If AI is enabled and we got a signal, ask the AI to review.
-        # Kota dostu: ajan başına en az AI_MIN_INTERVAL_SEC aralıkla çağır.
-        if self.ai_enabled and decision.get("action") == "TRADE":
-            if time.time() - self._last_ai_call >= AI_MIN_INTERVAL_SEC:
-                self._last_ai_call = time.time()
-                ai_review = await self._ai_review(decision, snapshot)
-                if ai_review:
-                    decision["ai_review"] = ai_review
+        # 2) YEREL PERSONA BEYNİ — her kararda çalışır, bedava, anlık.
+        #    Kişilik bu işlemi kendi felsefesiyle değerlendirir; beğenmezse
+        #    VETO eder. LLM kotası bittiğinde bile zihin çalışmaya devam eder.
+        micro = self.strategy.data.microstructure_snapshot()
+        market_prob = (snapshot.up_price if signal.direction == "UP"
+                       else snapshot.down_price)
+        delta, reason = local_persona_judgment(
+            self.strategy.name, signal.direction, micro, market_prob
+        )
+
+        if delta is None:
+            # Kişilik işlemi reddetti
+            self.ai_overrides += 1
+            self.strategy.last_skip_reason = f"{self.persona['title']}: {reason}"
+            self.strategy.last_signal = signal
+            logger.info(f"🚫 [{self.name}] {self.persona['title']} REDDETTİ: {reason}")
+            veto = {
+                "timestamp": time.time(),
+                "strategy": self.strategy.name,
+                "direction": signal.direction,
+                "confidence": round(signal.confidence, 3),
+                "action": "PERSONA_VETO",
+                "reasoning": signal.reasoning,
+                "persona_reason": reason,
+                "trade": None,
+            }
+            self.decision_history.append(veto)
+            if len(self.decision_history) > 50:
+                self.decision_history.pop(0)
+            return veto
+
+        # Kişilik onayladı — kendi görüşüyle güveni ayarlar
+        if delta:
+            signal.confidence = max(0.05, min(0.95, signal.confidence + delta))
+            signal.reasoning = f"{signal.reasoning} | {self.persona['title']}: {reason}"
+
+        # 3) İşlemi normal hattan geçir (koruma bantları + Kelly burada)
+        decision = self.strategy._process_signal(signal, snapshot, ai_initiated=False)
+        if decision is None:
+            return None
+        decision["persona_note"] = reason
+
+        # 4) LLM incelemesi — SADECE kota varsa (günde ~20 istek sınırı).
+        #    Kota yoksa sistem yerel beyinle sorunsuz devam eder.
+        if (self.ai_enabled and decision.get("action") == "TRADE"
+                and BUDGET.can_spend("general")
+                and time.time() - self._last_ai_call >= AI_MIN_INTERVAL_SEC):
+            self._last_ai_call = time.time()
+            ai_review = await self._ai_review(decision, snapshot)
+            if ai_review:
+                decision["ai_review"] = ai_review
 
         self.decision_history.append(decision)
         if len(self.decision_history) > 50:
@@ -167,33 +210,47 @@ fırsat görüyorsan güveni artır.
 SADECE JSON döndür:
 {{"approve": true/false, "confidence_adjustment": -0.15..+0.15, "reasoning": "tek cümle, Türkçe, kendi sesinle"}}"""
 
+        review = await self._llm_json(prompt, purpose="general")
+        if not review:
+            return None
+
+        if not review.get("approve", True):
+            self.ai_overrides += 1
+            logger.info(
+                f"🤖 [{self.name}] AI itiraz etti: {review.get('reasoning', 'N/A')}"
+            )
+        return review
+
+    async def _llm_json(self, prompt: str, purpose: str = "general") -> Optional[dict]:
+        """
+        Tek LLM çağrı noktası: bütçe kontrolü + 429 yakalama + JSON ayrıştırma.
+
+        Ücretsiz katman günde ~20 istek verdiği için her çağrı bütçeden
+        geçer. Kota dolarsa (429) tüm ajanlar için bir süre çağrı durdurulur
+        ve sistem yerel persona beyniyle çalışmaya devam eder.
+        """
+        if not self.client or not BUDGET.can_spend(purpose):
+            return None
         try:
-            import asyncio
+            BUDGET.spend()
+            self.total_ai_calls += 1
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model=GEMINI_MODEL,
                 contents=prompt,
             )
-            text = response.text.strip()
-            # Try to parse JSON from response
+            text = (response.text or "").strip()
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0].strip()
-
-            review = json.loads(text)
-
-            if not review.get("approve", True):
-                self.ai_overrides += 1
-                logger.info(
-                    f"🤖 [{self.name}] AI OVERRIDE: Blocked trade. "
-                    f"Reason: {review.get('reasoning', 'N/A')}"
-                )
-
-            return review
-
+            return json.loads(text)
         except Exception as e:
-            logger.debug(f"AI review failed: {e}")
+            msg = str(e)
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                BUDGET.mark_exhausted()
+            else:
+                logger.debug(f"LLM çağrısı başarısız ({purpose}): {e}")
             return None
 
     async def ai_initiate(self, snapshot: PolymarketSnapshot) -> Optional[dict]:
@@ -253,18 +310,9 @@ SADECE JSON:
   "reasoning": "tek cümle Türkçe gerekçe"}}"""
 
         try:
-            self.total_ai_calls += 1
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            text = (response.text or "").strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-            d = json.loads(text)
+            d = await self._llm_json(prompt, purpose="general")
+            if not d:
+                return None
 
             if not d.get("trade"):
                 return None
@@ -349,18 +397,10 @@ SADECE JSON:
   "key_lesson": "tek cümle en önemli ders"}}"""
 
         try:
-            self.total_ai_calls += 1
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            text = (response.text or "").strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-            d = json.loads(text)
+            # Öz-değerlendirme kotanın ayrılmış payını kullanır (en değerli iş)
+            d = await self._llm_json(prompt, purpose="reflection")
+            if not d:
+                return
 
             new_thesis = (d.get("thesis") or "").strip()
             if new_thesis:
@@ -494,19 +534,9 @@ SADECE JSON döndür:
 {{"changes": {{"param_adi": deger}}, "reasoning": "tek cümle Türkçe gerekçe"}}"""
 
         try:
-            self.total_ai_calls += 1
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            text = (response.text or "").strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-
-            data = json.loads(text)
+            data = await self._llm_json(prompt, purpose="reflection")
+            if not data:
+                return
             changes = data.get("changes") or {}
             if not changes:
                 return
