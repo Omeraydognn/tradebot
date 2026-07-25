@@ -81,12 +81,25 @@ async def strategy_loop(agents: list[AIAgent], data: MarketDataService, paper: P
             await asyncio.sleep(10)
             continue
 
-        # Evaluate all strategies
+        # Mekanik stratejileri değerlendir (AI her birini kendi kimliğiyle inceler)
+        silent_agents = []
         for agent in agents:
             try:
-                await agent.evaluate(snapshot)
+                decision = await agent.evaluate(snapshot)
+                if decision is None:
+                    silent_agents.append(agent)
             except Exception as e:
                 logger.error(f"Error in {agent.name}: {e}")
+
+        # AI İNİSİYATİFİ: stratejisi sessiz kalan ajanlar piyasaya KENDİ
+        # gözleriyle bakar; kimliğine uyan bir fırsat görürse işlemi kendisi
+        # başlatır. Kota dostu olsun diye ~1 dakikada bir ve sırayla.
+        if cycle % 6 == 0 and silent_agents:
+            idx = (cycle // 6) % len(silent_agents)
+            try:
+                await silent_agents[idx].ai_initiate(snapshot)
+            except Exception as e:
+                logger.debug(f"AI initiate error: {e}")
 
         # Resolution: her trade, penceresinin RESMİ (Chainlink tabanlı)
         # Polymarket çözümüyle kapatılır — Binance tahminiyle değil.
@@ -94,11 +107,19 @@ async def strategy_loop(agents: list[AIAgent], data: MarketDataService, paper: P
 
         # İşlem sonuçlandıysa: ajanlar öğrenip stratejilerini adapte etsin
         if resolved:
+            leaderboard = paper.get_leaderboard()
             for agent in agents:
                 try:
                     agent.maybe_adapt()
+                    # ÖZ-DEĞERLENDİRME: ajan kendi tezini yeniden yazar ve
+                    # rakiplerinin sonuçlarını görür (rekabetten öğrenme)
+                    if agent.maybe_reflect():
+                        await agent.reflect(leaderboard)
+                        agent._trades_at_last_reflect = (
+                            paper.portfolios[agent.strategy.name].total_trades
+                        )
                 except Exception as e:
-                    logger.error(f"Adapt error in {agent.name}: {e}")
+                    logger.error(f"Adapt/reflect error in {agent.name}: {e}")
 
         # Her ~10 dakikada bir DERİN AI ayarı (Gemini strateji eşiklerini optimize eder)
         if cycle % 60 == 0:

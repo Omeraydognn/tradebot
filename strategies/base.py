@@ -162,6 +162,25 @@ class BaseStrategy(ABC):
             return False
         return any(t.market_window == window_start for t in portfolio.pending_trades)
 
+    def execute_ai_signal(self, snapshot: PolymarketSnapshot, direction: str,
+                          confidence: float, reasoning: str) -> Optional[dict]:
+        """
+        AI'ın KENDİ inisiyatifiyle ürettiği sinyali işleme sokar.
+
+        Mekanik strateji sessizken ajan bir fırsat gördüğünde buradan geçer.
+        ÖNEMLİ: normal işlem hattının aynısını kullanır — yani koruma bantları
+        (fiyat aralığı, pencere sonu, pencere başına tek pozisyon, EV eşiği,
+        Kelly boyutlandırma) AI için de aynen geçerlidir. AI bunları aşamaz;
+        sadece "ne zaman bakılacağına" karar verir, risk kurallarına değil.
+        """
+        signal = Signal(
+            direction=direction,
+            confidence=confidence,
+            reasoning=reasoning,
+            indicators={"source": "ai_initiative"},
+        )
+        return self._process_signal(signal, snapshot, ai_initiated=True)
+
     def evaluate_and_trade(self, snapshot: PolymarketSnapshot) -> Optional[dict]:
         """
         Full pipeline: generate signal → calculate EV → place paper trade if +EV.
@@ -173,6 +192,12 @@ class BaseStrategy(ABC):
         signal = self.generate_signal(snapshot)
         if signal is None:
             return None
+
+        return self._process_signal(signal, snapshot, ai_initiated=False)
+
+    def _process_signal(self, signal, snapshot: PolymarketSnapshot,
+                        ai_initiated: bool = False) -> Optional[dict]:
+        """Sinyali kalibre eder, EV hesaplar, koruma bantlarını uygular, işlem açar."""
 
         self.last_signal = signal
         self.total_signals += 1
@@ -201,6 +226,7 @@ class BaseStrategy(ABC):
             "spread_cost": round(share_price - mid_price, 4),
             "implied_prob": round(mid_price, 3),
             "ev": round(ev, 4),
+            "ai_initiated": ai_initiated,
             "reasoning": signal.reasoning,
             "indicators": signal.indicators,
             "action": "SKIP",

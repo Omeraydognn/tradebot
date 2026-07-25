@@ -95,6 +95,11 @@ def save_state(paper_trader, agents, path: str = STATE_FILE, online_model=None) 
                 "tunables": a.strategy.get_tunables() if hasattr(a.strategy, "get_tunables") else {},
                 # Güven kalibratörü (öğrenilmiş a, b + ham örnekler)
                 "calibrator": a.strategy.calibrator.dump() if hasattr(a.strategy, "calibrator") else {},
+                # Ajanın KENDİ yazdığı tez (öz-değerlendirmeyle gelişir) — kaybolmamalı
+                "thesis": getattr(a, "thesis", ""),
+                "reflections": getattr(a, "reflections", [])[-10:],
+                "ai_initiated": getattr(a, "ai_initiated", 0),
+                "trades_at_last_reflect": getattr(a, "_trades_at_last_reflect", 0),
             }
 
         state = {
@@ -165,6 +170,11 @@ def load_state(paper_trader, agents, path: str = STATE_FILE, online_model=None) 
             cal = ad.get("calibrator") or {}
             if cal and hasattr(a.strategy, "calibrator"):
                 a.strategy.calibrator.load(cal)
+            # Ajanın öğrendiği tez ve öz-değerlendirmeleri geri yükle
+            a.thesis = ad.get("thesis", "")
+            a.reflections = ad.get("reflections") or []
+            a.ai_initiated = ad.get("ai_initiated", 0)
+            a._trades_at_last_reflect = ad.get("trades_at_last_reflect", 0)
 
         # Online model (öğrenilmiş ağırlıklar)
         if online_model is not None and state.get("online_model"):
