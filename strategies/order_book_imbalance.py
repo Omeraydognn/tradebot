@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class OrderBookImbalanceStrategy(BaseStrategy):
     def __init__(self, data: MarketDataService, paper: PaperTrader):
         super().__init__(name="Order Book Imbalance", data=data, paper=paper)
-        self.imbalance_threshold = 0.20  # 20% imbalance to trigger
+        self.imbalance_threshold = 0.10  # 10% imbalance to trigger (daha sık)
 
     def _calc_side_pressure(self, bids: list, asks: list) -> float:
         """

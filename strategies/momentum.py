@@ -42,8 +42,8 @@ class MomentumStrategy(BaseStrategy):
             "btc_price": round(price, 2),
         }
 
-        # Bullish momentum
-        if rsi > 55 and ema9 > ema21:
+        # Bullish momentum (eşik 55->52: daha sık sinyal)
+        if rsi > 52 and ema9 > ema21:
             # Confidence scales with RSI distance from neutral
             rsi_strength = min((rsi - 50) / 30, 1.0)  # 0-1 scale
             ema_gap = (ema9 - ema21) / ema21 * 100      # percentage gap
@@ -59,8 +59,8 @@ class MomentumStrategy(BaseStrategy):
                 indicators=indicators,
             )
 
-        # Bearish momentum
-        elif rsi < 45 and ema9 < ema21:
+        # Bearish momentum (eşik 45->48: daha sık sinyal)
+        elif rsi < 48 and ema9 < ema21:
             rsi_strength = min((50 - rsi) / 30, 1.0)
             ema_gap = (ema21 - ema9) / ema21 * 100
             ema_strength = min(abs(ema_gap) / 0.5, 1.0)

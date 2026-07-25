@@ -8,3 +8,6 @@ venv/
 # Model artefaktları / eğitilmiş çıktılar
 *.pth
 *.pkl
+
+# Secrets — asla commit etme
+.env

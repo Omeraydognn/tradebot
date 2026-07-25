@@ -26,6 +26,8 @@ class Trade:
     result: Optional[str] = None     # "WIN", "LOSE", or None (pending)
     pnl: Optional[float] = None      # profit/loss after resolution
     resolved_at: Optional[float] = None
+    market_window: int = 0           # ait olduğu 5dk pencerenin başlangıcı (unix)
+    resolve_at: float = 0.0          # bu trade'in çözüleceği zaman (pencere sonu, unix)
 
     def to_dict(self) -> dict:
         return {
@@ -54,6 +56,7 @@ class StrategyPortfolio:
     max_drawdown: float = 0.0
     trades: list = field(default_factory=list)
     pending_trades: list = field(default_factory=list)
+    balance_history: list = field(default_factory=list)  # [(timestamp, balance), ...]
 
     @property
     def win_rate(self) -> float:
@@ -80,6 +83,8 @@ class StrategyPortfolio:
             "win_rate": round(self.win_rate, 1),
             "max_drawdown": round(self.max_drawdown, 1),
             "last_10_trades": [t.to_dict() for t in self.trades[-10:]],
+            "open_trades": [t.to_dict() for t in self.pending_trades],
+            "balance_history": self.balance_history[-60:],  # P&L grafiği
         }
 
 
@@ -105,6 +110,8 @@ class PaperTrader:
         side: str,
         share_price: float,
         bet_amount: float,
+        market_window: int = 0,
+        resolve_at: float = 0.0,
     ) -> Optional[Trade]:
         """
         Place a paper trade.
@@ -147,6 +154,8 @@ class PaperTrader:
             shares=shares,
             fee=fee,
             payout_if_win=payout_if_win,
+            market_window=market_window,
+            resolve_at=resolve_at,
         )
 
         # Deduct cost from balance
@@ -190,6 +199,10 @@ class PaperTrader:
         portfolio.total_trades += 1
         portfolio.total_pnl += trade.pnl
         portfolio.trades.append(trade)
+        # Bakiye geçmişi (P&L grafiği için) — son 200 nokta tut
+        portfolio.balance_history.append((round(trade.resolved_at, 1), round(portfolio.balance, 2)))
+        if len(portfolio.balance_history) > 200:
+            portfolio.balance_history.pop(0)
 
         # Update peak/drawdown
         if portfolio.balance > portfolio.peak_balance:

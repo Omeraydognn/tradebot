@@ -14,7 +14,9 @@ from dataclasses import dataclass
 
 from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
-from config import POLYMARKET_FEE_RATE
+from config import (
+    POLYMARKET_FEE_RATE, PRICE_MIN, PRICE_MAX, NO_TRADE_LAST_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,9 @@ class BaseStrategy(ABC):
         self.last_ev: float = 0.0
         self.total_signals: int = 0
         self.ai_decisions: list[dict] = []  # log of AI-enhanced decisions
-        self.bet_size: float = 10.0  # default $10 per trade
+        # Adaptif AI bunları outcome'lara göre değiştirir:
+        self.bet_size: float = 10.0   # işlem başına $ (2-50 arası ayarlanır)
+        self.min_ev: float = 0.02     # işlem için gereken min EV (0.0-0.15 arası)
 
     @abstractmethod
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
@@ -125,13 +129,21 @@ class BaseStrategy(ABC):
             "trade": None,
         }
 
-        # Only trade if EV is positive and confidence is above minimum threshold
-        if ev > 0.02:  # require at least 2 cents EV per share
+        # --- KORUMA BANTLARI (guardrails) ---
+        # 1) Aşırı fiyat: $0.10-$0.90 dışında işlem yok (sonuç neredeyse belli).
+        # 2) Pencere sonu: son NO_TRADE_LAST_SECONDS sn içinde yeni işlem yok.
+        time_left = (snapshot.window_end - time.time()) if snapshot.window_end else 999.0
+        price_ok = PRICE_MIN <= share_price <= PRICE_MAX
+        time_ok = time_left >= NO_TRADE_LAST_SECONDS
+
+        if ev > self.min_ev and price_ok and time_ok:
             trade = self.paper.place_paper_trade(
                 strategy_name=self.name,
                 side=signal.direction,
                 share_price=share_price,
                 bet_amount=self.bet_size,
+                market_window=snapshot.window_start,
+                resolve_at=snapshot.window_end,
             )
             if trade:
                 decision["action"] = "TRADE"
@@ -141,10 +153,14 @@ class BaseStrategy(ABC):
                     f"Share: ${share_price:.2f} | EV: ${ev:+.3f} | {signal.reasoning}"
                 )
         else:
-            logger.debug(
-                f"⏭️  [{self.name}] Skip {signal.direction} | Conf: {signal.confidence:.0%} | "
-                f"Share: ${share_price:.2f} | EV: ${ev:+.3f} (too low)"
-            )
+            if not price_ok:
+                reason = f"fiyat uçta (${share_price:.2f})"
+            elif not time_ok:
+                reason = f"pencere sonu ({time_left:.0f}s kaldı)"
+            else:
+                reason = f"EV düşük (${ev:+.3f} < {self.min_ev:.2f})"
+            decision["skip_reason"] = reason
+            logger.debug(f"⏭️  [{self.name}] Skip {signal.direction} | {reason}")
 
         # Keep decision log (max 100)
         self.ai_decisions.append(decision)
@@ -166,6 +182,8 @@ class BaseStrategy(ABC):
                 "reasoning": self.last_signal.reasoning,
             } if self.last_signal else None,
             "last_ev": round(self.last_ev, 4),
+            "bet_size": round(self.bet_size, 2),
+            "min_ev": round(self.min_ev, 3),
             "portfolio": portfolio.to_dict() if portfolio else None,
             "recent_decisions": self.ai_decisions[-5:],
         }

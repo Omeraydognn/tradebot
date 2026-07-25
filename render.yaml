@@ -1,0 +1,15 @@
+# Render.com deploy yapılandırması
+# Bu dosyayı repoya push edip Render'da "New +" -> "Blueprint" ile bağla.
+services:
+  - type: web
+    name: polymarket-ai-trading
+    runtime: python
+    region: frankfurt   # ÖNEMLİ: Binance ABD IP'lerini engeller; EU bölgesi şart
+    plan: free          # 15 dk inaktivite sonrası uyur; sürekli çalışsın istersen 'starter' (ücretli)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false     # Render panelinden GİZLİ olarak elle gir (repoya yazma!)
+      - key: PYTHON_VERSION
+        value: "3.12.6"

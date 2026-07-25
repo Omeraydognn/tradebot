@@ -306,6 +306,88 @@ td {
 }
 .badge.win { background: rgba(16, 185, 129, 0.2); color: var(--up-color); }
 .badge.lose { background: rgba(239, 68, 68, 0.2); color: var(--down-color); }
+.badge.pending { background: rgba(148, 163, 184, 0.18); color: var(--text-muted); }
+
+.muted { color: var(--text-muted); }
+
+/* Per-strategy trade list (strateji kartı içinde) */
+.strat-trades {
+    border-top: 1px solid var(--panel-border);
+    padding-top: 10px;
+}
+.strat-trades-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+}
+.trade-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 190px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+.trade-row {
+    display: grid;
+    grid-template-columns: 44px 1fr 1fr auto auto;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    background: rgba(0, 0, 0, 0.22);
+    border-radius: 6px;
+    font-size: 0.78rem;
+    animation: fadeIn 0.3s ease-out;
+}
+.side-badge {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-align: center;
+    padding: 2px 0;
+    border-radius: 4px;
+}
+.side-badge.side-up { background: rgba(16, 185, 129, 0.18); color: var(--up-color); }
+.side-badge.side-down { background: rgba(239, 68, 68, 0.18); color: var(--down-color); }
+.trade-entry { color: var(--text-main); }
+.trade-amt { font-size: 0.72rem; }
+.trade-pnl { text-align: right; font-weight: 600; }
+.trade-pnl.positive { color: var(--up-color); }
+.trade-pnl.negative { color: var(--down-color); }
+.no-trades {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 12px 0;
+}
+
+/* P&L sparkline + adaptasyon */
+.strat-chart { display: flex; flex-direction: column; gap: 6px; }
+.strat-chart-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-muted);
+}
+.sparkline {
+    width: 100%;
+    height: 46px;
+    display: block;
+}
+.adapt-note {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    background: rgba(124, 58, 237, 0.10);
+    border-left: 2px solid var(--color-vwap);
+    padding: 4px 8px;
+    border-radius: 4px;
+    line-height: 1.3;
+}
 
 /* Feed */
 .feed-container {

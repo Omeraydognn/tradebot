@@ -28,7 +28,7 @@ class BollingerBreakoutStrategy(BaseStrategy):
     def __init__(self, data: MarketDataService, paper: PaperTrader):
         super().__init__(name="Bollinger Breakout", data=data, paper=paper)
         self.period = 20
-        self.std_dev = 2.0
+        self.std_dev = 1.5  # 2.0->1.5: bantlar daralır, breakout daha sık
 
     def _band_width_percentile(self) -> Optional[float]:
         """
