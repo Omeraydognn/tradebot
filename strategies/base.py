@@ -153,6 +153,34 @@ class BaseStrategy(ABC):
         ev = (signal.confidence * profit_if_win) - ((1 - signal.confidence) * cost_if_lose) - fee
         return ev
 
+    def _blend_with_market(self, our_conf: float, direction: str,
+                           snapshot: PolymarketSnapshot) -> float:
+        """
+        Güveni piyasa olasılığına doğru büzer (Bayesçi shrinkage).
+
+        NEDEN GEREKLİ (üretimde gerçek zarar gözlendi):
+          Piyasa UP için $0.07 derken (=%7 ihtimal) stratejilerimiz "%70
+          eminim" deyip alıyordu. 60+ puanlık bu fark neredeyse hiçbir zaman
+          gerçek avantaj değildir — bizim uydurma güvenimizin hatasıdır.
+          EV formülü bu sahte güvenle beslenince her seferinde "muhteşem
+          fırsat" gösteriyor ve sistem sistematik olarak para kaybediyordu.
+
+        MANTIK:
+          Piyasa fiyatı, para koymuş binlerce katılımcının bilgisidir; güçlü
+          bir önseldir. Kendi görüşümüze ancak KANITLADIĞIMIZ kadar ağırlık
+          veririz. Kalibratörde veri yokken piyasaya çok, veri biriktikçe
+          kendimize daha fazla güveniriz.
+        """
+        market_prob = snapshot.up_price if direction == "UP" else snapshot.down_price
+        market_prob = max(0.01, min(0.99, market_prob))
+
+        # Kalibrasyon kanıtı arttıkça kendi görüşümüzün ağırlığı artar (max %50)
+        n = len(self.calibrator.samples)
+        own_weight = min(0.50, 0.15 + 0.35 * min(1.0, n / 60.0))
+
+        blended = own_weight * our_conf + (1 - own_weight) * market_prob
+        return max(0.05, min(0.95, blended))
+
     def has_position_in_window(self, window_start: int) -> bool:
         """Bu 5dk penceresinde zaten açık pozisyon var mı? (yığılmayı önler)"""
         if not window_start:
@@ -207,6 +235,13 @@ class BaseStrategy(ABC):
         # (tahmin, sonuç) çiftlerine bakıp gerçeğe hizalanmış güveni kullan.
         raw_conf = signal.confidence
         signal.confidence = self.calibrator.calibrate(raw_conf)
+
+        # --- PİYASA ÖNSELİ (market prior) ---
+        # Piyasa fiyatı, binlerce katılımcının parasını koyduğu bir olasılık
+        # tahminidir ve güçlü bir önseldir. Bizim güvenimiz henüz KANITLANMADI.
+        # Bu yüzden güven, piyasa olasılığına doğru büzülür (Bayesçi shrinkage).
+        # Kalibrasyon verisi biriktikçe kendi görüşümüze daha çok ağırlık verilir.
+        signal.confidence = self._blend_with_market(signal.confidence, signal.direction, snapshot)
 
         ev = self.calculate_ev(signal, snapshot)
         self.last_ev = ev

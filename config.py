@@ -28,10 +28,16 @@ POLYMARKET_FEE_RATE = float(os.getenv("POLYMARKET_FEE_RATE", "0.0"))
 # --- İşlem koruma bantları (guardrails) ---
 # Fiyat bu bandın DIŞINDAysa işlem açma (Implied Arb'ın $0.01'e DOWN alıp
 # batmasını önler — uçtaki fiyat = sonuç neredeyse belli).
-PRICE_MIN = float(os.getenv("PRICE_MIN", "0.10"))
-PRICE_MAX = float(os.getenv("PRICE_MAX", "0.90"))
+# Yalnızca piyasanın GERÇEKTEN kararsız olduğu bantta işlem yap.
+# $0.18'de alım = piyasa "%18 ihtimal" diyor; orada ona karşı gelmek için
+# kanıtlanmış bir avantaj gerekir — bizde yok. Üretimde bu tür işlemlerin
+# sistematik zarar ettiği gözlendi (piyasa 0.07'ye giderken UP alınıyordu).
+PRICE_MIN = float(os.getenv("PRICE_MIN", "0.25"))
+PRICE_MAX = float(os.getenv("PRICE_MAX", "0.75"))
 # Pencere sonuna bu kadar saniyeden az kaldıysa yeni işlem açma.
-NO_TRADE_LAST_SECONDS = float(os.getenv("NO_TRADE_LAST_SECONDS", "60"))
+# 5 dakikalık pencerenin son 2 dakikasında sonuç büyük ölçüde belirlenmiştir;
+# 60sn çok geçti (65sn kala açılan işlemler piyango bileti gibiydi).
+NO_TRADE_LAST_SECONDS = float(os.getenv("NO_TRADE_LAST_SECONDS", "120"))
 
 # --- Adaptif AI ---
 # Her strateji bu kadar SONUÇLANMIŞ işlemde bir kendini yeniden ayarlar.

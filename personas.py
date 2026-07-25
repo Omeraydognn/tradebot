@@ -136,3 +136,152 @@ DEFAULT_PERSONA = {
 def get_persona(strategy_name: str) -> dict:
     """Strateji adına göre kişilik döndürür (bilinmeyen için varsayılan)."""
     return PERSONAS.get(strategy_name, DEFAULT_PERSONA)
+
+
+# ---------------------------------------------------------------------------
+# YEREL PERSONA BEYNİ
+#
+# Gemini ücretsiz katmanı günde ~20 istek veriyor; her kararda LLM çağırmak
+# imkânsız. Bu yüzden her kişiliğin felsefesi BURADA deterministik kurallara
+# çevrilir: her kararda çalışır, bedava, anlıktır. LLM ise nadiren çağrılıp
+# ajanın TEZİNİ günceller (politika yazar, kararı yerel kod uygular).
+#
+# Her fonksiyon (delta, sebep) döndürür:
+#   delta > 0  -> kişilik bu işlemi beğendi, güven artar
+#   delta < 0  -> kişilik şüpheci, güven azalır
+#   delta None -> kişilik bu işlemi REDDEDİYOR (veto)
+# ---------------------------------------------------------------------------
+
+def _f(micro: dict, key: str, default=None):
+    v = micro.get(key)
+    return default if v is None else float(v)
+
+
+def _trend_hunter(direction, micro, market_prob):
+    """Trend Avcısı: momentum ve akış uyumu ister, yatay piyasadan nefret eder."""
+    mom5 = _f(micro, "momentum_5m", 0.0)
+    tf = _f(micro, "tf_alignment", 0.0)
+    cvd = _f(micro, "cvd_ratio_60s", 0.0)
+    want_up = direction == "UP"
+
+    aligned = sum([
+        (mom5 > 0) == want_up,
+        (tf > 0) == want_up,
+        (cvd > 0) == want_up,
+    ])
+    if aligned <= 1:
+        return None, f"momentum/akış işlemle uyuşmuyor ({aligned}/3 uyum) — trend yok"
+    if abs(tf) < 0.5:
+        return -0.04, "zaman dilimleri kararsız, ivme zayıf"
+    return (0.05 if aligned == 3 else 0.02), f"trend uyumlu ({aligned}/3)"
+
+
+def _patient_contrarian(direction, micro, market_prob):
+    """Sabırlı Dönüşçü: sadece gerçek AŞIRILIKTA girer, aksi halde bekler."""
+    vol = _f(micro, "realized_vol", 0.0)
+    mom5 = _f(micro, "momentum_5m", 0.0)
+    # Dönüş bahsi: fiyat hareketinin TERSİNE pozisyon alınmalı
+    contrarian = (mom5 > 0 and direction == "DOWN") or (mom5 < 0 and direction == "UP")
+    if not contrarian:
+        return None, "bu bir dönüş işlemi değil — trendle aynı yönde, ben girmem"
+    if abs(mom5) < 0.02:
+        return None, f"hareket çok küçük (%{abs(mom5):.3f}) — aradığım aşırılık yok"
+    if vol < 0.002:
+        return -0.03, "oynaklık düşük, dönüş için yeterli gerilim yok"
+    return 0.04, f"aşırılık var (%{abs(mom5):.3f} hareket) — dönüş beklerim"
+
+
+def _flow_reader(direction, micro, market_prob):
+    """Akış Okuyucu: defter ve CVD aynı yöne bakmalı; çelişkide veto."""
+    book = _f(micro, "book_imbalance")
+    cvd = _f(micro, "cvd_ratio_60s")
+    if book is None or cvd is None:
+        return None, "mikroyapı verisi eksik — kör uçmam"
+    want_up = direction == "UP"
+    book_ok = (book > 0) == want_up
+    cvd_ok = (cvd > 0) == want_up
+    if book_ok and cvd_ok:
+        return 0.05, f"defter ve akış hemfikir (defter={book:+.2f}, CVD={cvd:+.2f})"
+    if not book_ok and not cvd_ok:
+        return None, f"defter ve akış İŞLEME KARŞI (defter={book:+.2f}, CVD={cvd:+.2f})"
+    return None, f"defter ve akış çelişiyor (defter={book:+.2f}, CVD={cvd:+.2f}) — sahte duvar olabilir"
+
+
+def _volatility_hunter(direction, micro, market_prob):
+    """Volatilite Fırsatçısı: sıkışma sonrası hareket arar, hacim teyidi ister."""
+    vol = _f(micro, "realized_vol", 0.0)
+    mom5 = _f(micro, "momentum_5m", 0.0)
+    cvd = _f(micro, "cvd_ratio_60s", 0.0)
+    if vol < 0.0015:
+        return None, "piyasa çok sakin — kırılım yok, beklerim"
+    want_up = direction == "UP"
+    if (mom5 > 0) != want_up:
+        return None, "kırılım yönü işlemle ters"
+    if (cvd > 0) != want_up:
+        return -0.05, "kırılımı hacim teyit etmiyor — yalancı olabilir"
+    return 0.04, f"oynaklık {vol:.4f} + hacim teyidi var"
+
+
+def _value_hunter(direction, micro, market_prob):
+    """Değer Avcısı: piyasa uçlardayken ona karşı gelmez; ortada fırsat arar."""
+    if market_prob <= 0.30 or market_prob >= 0.70:
+        return None, f"piyasa kararlı (${market_prob:.2f}) — kalabalığa karşı gelmek için kanıtım yok"
+    funding = _f(micro, "funding_rate", 0.0)
+    # Aşırı pozitif funding = long'lar kalabalık -> UP pahalı olabilir
+    if funding > 0.0002 and direction == "UP":
+        return -0.04, "funding yüksek, long'lar kalabalık — UP'a temkinliyim"
+    if funding < -0.0002 and direction == "DOWN":
+        return -0.04, "funding negatif, short'lar kalabalık — DOWN'a temkinliyim"
+    return 0.02, f"piyasa kararsız (${market_prob:.2f}) — burada fiyat sapması olabilir"
+
+
+def _synthesizer(direction, micro, market_prob):
+    """Sentezci: birden fazla bağımsız kanal hemfikir olmalı."""
+    want_up = direction == "UP"
+    votes = []
+    for key in ("cvd_ratio_60s", "book_imbalance", "momentum_5m", "tf_alignment"):
+        v = micro.get(key)
+        if v is None:
+            continue
+        votes.append((float(v) > 0) == want_up)
+    if len(votes) < 2:
+        return None, "yeterli kanal verisi yok"
+    agree = sum(votes)
+    if agree == len(votes):
+        return 0.05, f"tüm kanallar hemfikir ({agree}/{len(votes)})"
+    if agree <= len(votes) / 2:
+        return None, f"kanallar çelişiyor ({agree}/{len(votes)}) — beklerim"
+    return 0.01, f"kanalların çoğu uyumlu ({agree}/{len(votes)})"
+
+
+def _empiricist(direction, micro, market_prob):
+    """Öğrenen: kanıt yoksa risk almaz (model kalitesi stratejide kontrol edilir)."""
+    return 0.0, "saf istatistiğe güvenirim, ek yorum yapmam"
+
+
+LOCAL_BRAINS = {
+    "Momentum RSI+EMA": _trend_hunter,
+    "VWAP Mean Reversion": _patient_contrarian,
+    "Order Book Imbalance": _flow_reader,
+    "Bollinger Breakout": _volatility_hunter,
+    "Implied Prob. Arbitrage": _value_hunter,
+    "Microstructure Alpha": _synthesizer,
+    "Learned Alpha": _empiricist,
+}
+
+
+def local_persona_judgment(strategy_name: str, direction: str, micro: dict,
+                           market_prob: float):
+    """
+    Kişiliğin bu işlem hakkındaki YEREL kararı (LLM'siz, anlık, bedava).
+
+    Dönüş: (delta, sebep)
+      delta None -> kişilik işlemi REDDEDİYOR
+    """
+    brain = LOCAL_BRAINS.get(strategy_name)
+    if brain is None:
+        return 0.0, ""
+    try:
+        return brain(direction, micro or {}, market_prob)
+    except Exception:
+        return 0.0, ""
