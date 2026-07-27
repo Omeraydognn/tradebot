@@ -91,9 +91,20 @@ async def strategy_loop(agents: list[AIAgent], data: MarketDataService, paper: P
             except Exception as e:
                 logger.error(f"Error in {agent.name}: {e}")
 
+        # ZORUNLU MOD YEDEĞİ: sessiz kalan HER ajan için (kota gerektirmez,
+        # anında çalışır) mikroyapı yönünden basit bir sinyal üretip normal
+        # koruma bantlarından geçirir. Pencere başına tek pozisyon kuralı
+        # zaten fazla işlem açılmasını engeller.
+        for agent in silent_agents:
+            try:
+                agent.force_local_signal(snapshot)
+            except Exception as e:
+                logger.debug(f"Force local signal error in {agent.name}: {e}")
+
         # AI İNİSİYATİFİ: stratejisi sessiz kalan ajanlar piyasaya KENDİ
         # gözleriyle bakar; kimliğine uyan bir fırsat görürse işlemi kendisi
-        # başlatır. Kota dostu olsun diye ~1 dakikada bir ve sırayla.
+        # başlatır (LLM destekli, daha nüanslı gerekçe). Kota dostu olsun
+        # diye ~1 dakikada bir ve sırayla.
         if cycle % 6 == 0 and silent_agents:
             idx = (cycle // 6) % len(silent_agents)
             try:
@@ -223,6 +234,7 @@ async def train_online_model(data: MarketDataService, online_model) -> int:
             continue
         went_up = (outcome == "UP")
 
+        data.record_window_outcome(went_up)
         online_model.update(micro, went_up)
         learned += 1
         data.window_micro.pop(w, None)       # tekrar öğrenmeyi önle

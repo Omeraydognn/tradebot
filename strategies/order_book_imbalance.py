@@ -36,6 +36,7 @@ class OrderBookImbalanceStrategy(BaseStrategy):
         t = super().get_tunables()
         t["imbalance_threshold"] = {
             "value": self.imbalance_threshold, "min": 0.05, "max": 0.60,
+            "selectivity": True,
             "desc": "sinyal için gereken emir defteri dengesizliği",
         }
         return t

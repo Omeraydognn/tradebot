@@ -40,6 +40,7 @@ class LearnedStrategy(BaseStrategy):
         t = super().get_tunables()
         t.update({
             "min_conviction": {"value": self.min_conviction, "min": 0.01, "max": 0.20,
+                               "selectivity": True,
                                "desc": "sinyal için 0.50'den min sapma"},
             "require_beats_random": {"value": self.require_beats_random, "min": 0.0, "max": 1.0,
                                      "desc": "1=model rastgeleyi yenmeden işlem yapma"},

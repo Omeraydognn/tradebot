@@ -25,6 +25,16 @@ logger = logging.getLogger(__name__)
 class MomentumStrategy(BaseStrategy):
     def __init__(self, data: MarketDataService, paper: PaperTrader):
         super().__init__(name="Momentum RSI+EMA", data=data, paper=paper)
+        self.rsi_band = 2.0  # RSI 50'den bu kadar sapınca sinyal (52/48)
+
+    def get_tunables(self) -> dict:
+        t = super().get_tunables()
+        t["rsi_band"] = {
+            "value": self.rsi_band, "min": 1.0, "max": 10.0,
+            "selectivity": True,
+            "desc": "RSI 50'den gereken min sapma (düşük=sık sinyal, yüksek=seçici)",
+        }
+        return t
 
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
         rsi = self.data.calc_rsi(14)
@@ -42,8 +52,10 @@ class MomentumStrategy(BaseStrategy):
             "btc_price": round(price, 2),
         }
 
-        # Bullish momentum (eşik 55->52: daha sık sinyal)
-        if rsi > 52 and ema9 > ema21:
+        band = self.rsi_band
+
+        # Bullish momentum (eşik AI/kural tarafından ayarlanabilir: 50+band)
+        if rsi > 50 + band and ema9 > ema21:
             # Confidence scales with RSI distance from neutral
             rsi_strength = min((rsi - 50) / 30, 1.0)  # 0-1 scale
             ema_gap = (ema9 - ema21) / ema21 * 100      # percentage gap
@@ -59,8 +71,8 @@ class MomentumStrategy(BaseStrategy):
                 indicators=indicators,
             )
 
-        # Bearish momentum (eşik 45->48: daha sık sinyal)
-        elif rsi < 48 and ema9 < ema21:
+        # Bearish momentum (eşik AI/kural tarafından ayarlanabilir: 50-band)
+        elif rsi < 50 - band and ema9 < ema21:
             rsi_strength = min((50 - rsi) / 30, 1.0)
             ema_gap = (ema21 - ema9) / ema21 * 100
             ema_strength = min(abs(ema_gap) / 0.5, 1.0)

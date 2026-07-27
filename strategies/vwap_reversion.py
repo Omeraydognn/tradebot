@@ -27,6 +27,15 @@ class VWAPReversionStrategy(BaseStrategy):
         super().__init__(name="VWAP Mean Reversion", data=data, paper=paper)
         self.deviation_threshold = 0.0005  # 0.05% deviation triggers signal (daha sık)
 
+    def get_tunables(self) -> dict:
+        t = super().get_tunables()
+        t["deviation_threshold"] = {
+            "value": self.deviation_threshold, "min": 0.0002, "max": 0.003,
+            "selectivity": True,
+            "desc": "VWAP'tan gereken min sapma (düşük=sık sinyal, yüksek=seçici)",
+        }
+        return t
+
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
         vwap = self.data.calc_vwap(20)
         price = self.data.latest_btc_price

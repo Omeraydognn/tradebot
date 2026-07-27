@@ -18,7 +18,10 @@ from typing import Optional
 from strategies.base import BaseStrategy, Signal
 from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
-from config import GEMINI_API_KEY, GEMINI_MODEL, AI_MIN_INTERVAL_SEC, ADAPT_EVERY_N_TRADES
+from config import (
+    GEMINI_API_KEY, GEMINI_MODEL, AI_MIN_INTERVAL_SEC, ADAPT_EVERY_N_TRADES,
+    FORCE_TRADE_MODE,
+)
 from personas import get_persona, local_persona_judgment
 from ai_budget import BUDGET
 
@@ -100,25 +103,31 @@ class AIAgent:
         )
 
         if delta is None:
-            # Kişilik işlemi reddetti
-            self.ai_overrides += 1
-            self.strategy.last_skip_reason = f"{self.persona['title']}: {reason}"
-            self.strategy.last_signal = signal
-            logger.info(f"🚫 [{self.name}] {self.persona['title']} REDDETTİ: {reason}")
-            veto = {
-                "timestamp": time.time(),
-                "strategy": self.strategy.name,
-                "direction": signal.direction,
-                "confidence": round(signal.confidence, 3),
-                "action": "PERSONA_VETO",
-                "reasoning": signal.reasoning,
-                "persona_reason": reason,
-                "trade": None,
-            }
-            self.decision_history.append(veto)
-            if len(self.decision_history) > 50:
-                self.decision_history.pop(0)
-            return veto
+            if not FORCE_TRADE_MODE:
+                # Kişilik işlemi reddetti
+                self.ai_overrides += 1
+                self.strategy.last_skip_reason = f"{self.persona['title']}: {reason}"
+                self.strategy.last_signal = signal
+                logger.info(f"🚫 [{self.name}] {self.persona['title']} REDDETTİ: {reason}")
+                veto = {
+                    "timestamp": time.time(),
+                    "strategy": self.strategy.name,
+                    "direction": signal.direction,
+                    "confidence": round(signal.confidence, 3),
+                    "action": "PERSONA_VETO",
+                    "reasoning": signal.reasoning,
+                    "persona_reason": reason,
+                    "trade": None,
+                }
+                self.decision_history.append(veto)
+                if len(self.decision_history) > 50:
+                    self.decision_history.pop(0)
+                return veto
+            # ZORUNLU MOD: kişilik itiraz ediyor ama veto işlemi durduramaz —
+            # şüpheciliği güven kırılımına yansıt, karar normal hattan geçsin.
+            delta = -0.08
+            reason = f"(itiraz etti ama zorunlu modda izin veriyor) {reason}"
+            logger.info(f"⚠️  [{self.name}] {self.persona['title']} itiraz etti (zorunlu): {reason}")
 
         # Kişilik onayladı — kendi görüşüyle güveni ayarlar
         if delta:
@@ -259,6 +268,34 @@ SADECE JSON döndür:
                 logger.debug(f"LLM çağrısı başarısız ({purpose}, {model}): {e}")
                 return None
         return None
+
+    def force_local_signal(self, snapshot: PolymarketSnapshot) -> Optional[dict]:
+        """
+        ZORUNLU MOD YEDEĞİ: mekanik strateji bu pencerede hiç sinyal
+        üretmediyse (generate_signal None döndüyse), LLM'e ihtiyaç duymadan
+        mikroyapının ham yönünden (momentum) basit bir sinyal üretip normal
+        işlem hattından geçirir. Koruma bantları (fiyat, zaman, tek pozisyon)
+        burada da aynen geçerlidir — sadece "hiç bakmama" durumunu ortadan
+        kaldırır.
+        """
+        if not FORCE_TRADE_MODE or not self.strategy.is_active:
+            return None
+        if self.strategy.has_position_in_window(snapshot.window_start):
+            return None
+
+        micro = self.strategy.data.microstructure_snapshot()
+        mom = micro.get("momentum_5m")
+        if mom is None:
+            mom = micro.get("momentum_1m") or 0.0
+        direction = "UP" if mom >= 0 else "DOWN"
+
+        decision = self.strategy.execute_ai_signal(
+            snapshot, direction, 0.55,
+            "🔒 Zorunlu işlem: mekanik strateji sessizdi, mikroyapı yönü kullanıldı",
+        )
+        if decision and decision.get("action") == "TRADE":
+            self.ai_initiated += 1
+        return decision
 
     async def ai_initiate(self, snapshot: PolymarketSnapshot) -> Optional[dict]:
         """
@@ -445,10 +482,18 @@ SADECE JSON:
 
     def adapt(self):
         """
-        Kural tabanlı hızlı adaptasyon (her zaman çalışır, ücretsiz):
-          - Kazanıyorsa -> daha AGRESİF (bet↑, minEV↓)
-          - Kaybediyorsa -> daha SEÇİCİ (bet↓, minEV↑)
-        AI açıksa ayrıca `ai_tune()` ile derin parametre ayarı denenir.
+        Kural tabanlı hızlı adaptasyon (her zaman çalışır, ücretsiz, LLM'siz):
+          - Kazanıyorsa -> daha AGRESİF (bet↑, minEV↓, sinyal eşikleri gevşer)
+          - Kaybediyorsa -> daha SEÇİCİ (bet↓, minEV↑, sinyal eşikleri sıkılaşır)
+
+        ÖNEMLİ: sadece bet_size/min_ev değil, stratejinin KENDİ sinyal
+        üretim eşikleri de (RSI bandı, VWAP sapması, Bollinger genişliği,
+        emir defteri dengesizliği, min conviction, arb edge — get_tunables()
+        içinde "selectivity": True ile işaretli olanlar) buradan ayarlanır.
+        Böylece hatalardan gerçekten ders çıkarılır: strateji sürekli
+        kaybediyorsa mekaniği daha seçici hale gelir, kazanıyorsa daha çok
+        fırsat yakalamak için gevşer. AI açıksa ayrıca `ai_tune()` ile
+        LLM'in kendi muhakemesiyle daha ince ayar denenir.
         """
         port = self.strategy.paper.portfolios.get(self.strategy.name)
         if not port or port.total_trades < 1:
@@ -460,22 +505,43 @@ SADECE JSON:
         recent_pnl = sum((t.pnl or 0.0) for t in recent)
 
         old_bet, old_ev = self.strategy.bet_size, self.strategy.min_ev
+        winning = recent_wr >= 0.55 and recent_pnl > 0
+        losing = recent_wr < 0.40 or recent_pnl < 0
 
-        if recent_wr >= 0.55 and recent_pnl > 0:
+        if winning:
             self.strategy.bet_size = min(self.strategy.bet_size * 1.25, 50.0)
             self.strategy.min_ev = max(self.strategy.min_ev - 0.01, 0.0)
             mode = "AGRESİF"
-        elif recent_wr < 0.40 or recent_pnl < 0:
+        elif losing:
             self.strategy.bet_size = max(self.strategy.bet_size * 0.70, 2.0)
             self.strategy.min_ev = min(self.strategy.min_ev + 0.02, 0.15)
             mode = "SEÇİCİ"
         else:
             mode = "STABİL"
 
+        # --- Stratejinin kendi sinyal eşiklerini ayarla (gerçek "hatadan ders") ---
+        selectivity_note = ""
+        if winning or losing:
+            tun = self.strategy.get_tunables()
+            changes = {}
+            for key, spec in tun.items():
+                if key in ("bet_size", "min_ev", "kelly_fraction") or not spec.get("selectivity"):
+                    continue
+                lo, hi = spec["min"], spec["max"]
+                step = (hi - lo) * 0.08
+                new_val = spec["value"] - step if winning else spec["value"] + step
+                changes[key] = max(lo, min(hi, new_val))
+            if changes:
+                before = {k: tun[k]["value"] for k in changes}
+                self.strategy.set_tunables(changes)
+                selectivity_note = " | eşikler: " + ", ".join(
+                    f"{k} {before[k]:.4f}→{v:.4f}" for k, v in changes.items()
+                )
+
         note = (
             f"{mode}: son {len(recent)} işlem WR={recent_wr:.0%}, PnL=${recent_pnl:+.2f} → "
             f"bet ${old_bet:.0f}→${self.strategy.bet_size:.0f}, "
-            f"minEV {old_ev:.2f}→{self.strategy.min_ev:.2f}"
+            f"minEV {old_ev:.2f}→{self.strategy.min_ev:.2f}{selectivity_note}"
         )
         self.adaptations.append({"time": time.time(), "mode": mode, "note": note, "by": "kural"})
         if len(self.adaptations) > 20:

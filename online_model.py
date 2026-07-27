@@ -41,6 +41,9 @@ FEATURE_SPEC = [
     ("momentum_5m",         0.10),
     ("tf_alignment",        1.0),      # -1..1
     ("realized_vol",        0.02),
+    ("poly_book_imbalance", 1.0),      # Polymarket'in kendi UP defteri, -1..1
+    ("window_elapsed_frac", 1.0),      # pencerede ne kadar ilerlendiği, -1..1
+    ("outcome_streak",      3.0),      # ardışık UP/DOWN sayısı, ±3 -> ±1
 ]
 
 MIN_SAMPLES_TO_PREDICT = 25   # bu kadar sonuç görmeden tahmin vermez
