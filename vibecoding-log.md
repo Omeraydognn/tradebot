@@ -1,0 +1,1 @@
+- [Faz 2] domain: Testere/Yatay Piyasa (Choppy Market) | tech: Feature Flag
