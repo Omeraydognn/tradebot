@@ -29,6 +29,16 @@ class BollingerBreakoutStrategy(BaseStrategy):
         super().__init__(name="Bollinger Breakout", data=data, paper=paper)
         self.period = 20
         self.std_dev = 1.5  # 2.0->1.5: bantlar daralır, breakout daha sık
+        self.std_dev_mult = 1.0  # AI/kural bunu ayarlar; efektif std = std_dev*mult
+
+    def get_tunables(self) -> dict:
+        t = super().get_tunables()
+        t["std_dev_mult"] = {
+            "value": self.std_dev_mult, "min": 0.7, "max": 1.8,
+            "selectivity": True,
+            "desc": "bant genişliği çarpanı (düşük=sık kırılım, yüksek=seçici)",
+        }
+        return t
 
     def _band_width_percentile(self) -> Optional[float]:
         """
@@ -58,7 +68,7 @@ class BollingerBreakoutStrategy(BaseStrategy):
         return rank
 
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
-        bands = self.data.calc_bollinger(self.period, self.std_dev)
+        bands = self.data.calc_bollinger(self.period, self.std_dev * self.std_dev_mult)
         price = self.data.latest_btc_price
 
         if bands is None or price == 0:

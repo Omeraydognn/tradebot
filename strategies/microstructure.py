@@ -58,6 +58,7 @@ class MicrostructureStrategy(BaseStrategy):
             "w_oi": {"value": self.w_oi, "min": 0.0, "max": 0.5,
                      "desc": "açık pozisyon ağırlığı"},
             "min_conviction": {"value": self.min_conviction, "min": 0.01, "max": 0.20,
+                               "selectivity": True,
                                "desc": "sinyal için 0.50'den min sapma"},
         })
         return t

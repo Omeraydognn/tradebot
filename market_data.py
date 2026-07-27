@@ -129,6 +129,11 @@ class MarketDataService:
         # Likidasyonlar (forceOrder) — zorunlu akış, kısa vadeli itici güç
         self.liquidations: deque = deque(maxlen=400)  # (ts, side, qty_usd)
 
+        # Çözülen pencerelerin yön geçmişi (streak) — sadece SONUÇLANMIŞ
+        # pencereler eklenir, bu yüzden bir sonraki tahmin için ileriye
+        # bakış riski yoktur.
+        self.window_outcomes: deque = deque(maxlen=20)  # bool (went_up)
+
     # ------------------------------------------------------------------ #
     #  Binance WebSocket — real-time BTC/USDT trades + kline building     #
     # ------------------------------------------------------------------ #
@@ -541,6 +546,56 @@ class MarketDataService:
             return None
         return float(arr.std() / mean * 100)
 
+    def calc_poly_book_imbalance(self, levels: int = 5) -> Optional[float]:
+        """
+        Polymarket'in KENDİ UP defteri dengesizliği — Binance perp defterinden
+        bağımsız. Pozitif = UP tarafında alım baskısı kalın (piyasa UP'a
+        eğilimli fiyatlanıyor olabilir), negatif = DOWN'a doğru bir eğim.
+        """
+        snap = self.active_snapshot
+        if not snap or not snap.up_book_bids or not snap.up_book_asks:
+            return None
+        bid_vol = sum(q for _, q in snap.up_book_bids[:levels])
+        ask_vol = sum(q for _, q in snap.up_book_asks[:levels])
+        total = bid_vol + ask_vol
+        if total == 0:
+            return None
+        return float((bid_vol - ask_vol) / total)
+
+    def calc_window_elapsed_frac(self) -> Optional[float]:
+        """
+        5dk pencerenin ne kadarının geçtiği, -1 (yeni başladı) ... +1
+        (bitmek üzere) bandına ölçeklenmiş. Resolution'a yaklaştıkça
+        mikroyapı sinyallerinin gücü/güvenilirliği değişebilir.
+        """
+        snap = self.active_snapshot
+        if not snap or not snap.window_end or snap.window_end <= snap.window_start:
+            return None
+        frac = (time.time() - snap.window_start) / (snap.window_end - snap.window_start)
+        frac = max(0.0, min(1.0, frac))
+        return float(frac * 2 - 1)
+
+    def record_window_outcome(self, went_up: bool):
+        """Bir pencere resmi olarak çözüldüğünde çağrılır (streak takibi için)."""
+        self.window_outcomes.append(bool(went_up))
+
+    def calc_outcome_streak(self) -> Optional[float]:
+        """
+        Son çözülen pencerelerin ardışık aynı-yön sayısı, işaretli:
+        +N = N pencere üst üste UP, -N = N pencere üst üste DOWN.
+        Sadece SONUÇLANMIŞ pencerelerden geldiği için sızıntı yok.
+        """
+        if not self.window_outcomes:
+            return None
+        last = self.window_outcomes[-1]
+        streak = 0
+        for v in reversed(self.window_outcomes):
+            if v == last:
+                streak += 1
+            else:
+                break
+        return float(streak if last else -streak)
+
     def microstructure_snapshot(self) -> dict:
         """Tüm mikroyapı göstergelerini tek sözlükte döndürür (AI + dashboard)."""
         return {
@@ -557,6 +612,9 @@ class MarketDataService:
             "momentum_5m": self.calc_momentum_pct(300),
             "tf_alignment": self.calc_multi_tf_alignment(),
             "realized_vol": self.calc_realized_vol(300),
+            "poly_book_imbalance": self.calc_poly_book_imbalance(5),
+            "window_elapsed_frac": self.calc_window_elapsed_frac(),
+            "outcome_streak": self.calc_outcome_streak(),
         }
 
     # ------------------------------------------------------------------ #

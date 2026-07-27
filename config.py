@@ -54,5 +54,18 @@ NO_TRADE_LAST_SECONDS = float(os.getenv("NO_TRADE_LAST_SECONDS", "120"))
 # Her strateji bu kadar SONUÇLANMIŞ işlemde bir kendini yeniden ayarlar.
 ADAPT_EVERY_N_TRADES = int(os.getenv("ADAPT_EVERY_N_TRADES", "3"))
 
+# --- Zorunlu işlem modu ---
+# 25 Temmuz'daki "piyasaya karşı gitme" düzeltmesi (bkz. 96dd116) EV eşiğini
+# ve persona veto'sunu o kadar sıkılaştırdı ki sistem GÜN BOYU tek işlem
+# açmadı (state.json: 7 stratejiden 5'i total_trades=0). Öğrenme döngüsü
+# (kalibratör, adapt(), reflect()) sonuçlanmış işlem olmadan asla beslenmez.
+# FORCE_TRADE_MODE açıkken: fiyat/zaman/pencere koruma bantları AYNEN
+# kalır (uçtaki fiyata veya pencere sonuna hâlâ girilmez — bunlar gerçek
+# bilgi taşımaz), ama EV eşiği ve persona veto'su işlemi ENGELLEMEZ; sadece
+# bahis boyutunu/güveni etkiler. Amaç: her strateji her pencerede bir
+# pozisyon alsın, kazansın da kaybetsin de — kalibratör ve adaptasyon
+# gerçek veriyle beslensin.
+FORCE_TRADE_MODE = os.getenv("FORCE_TRADE_MODE", "true").lower() in ("1", "true", "yes")
+
 # Dashboard — Render/bulut $PORT verirse onu kullan, yoksa 5050
 DASHBOARD_PORT = int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT", "5050"))

@@ -31,6 +31,15 @@ class ImpliedArbStrategy(BaseStrategy):
         super().__init__(name="Implied Prob. Arbitrage", data=data, paper=paper)
         self.min_edge = 0.08  # minimum 8% edge to trade
 
+    def get_tunables(self) -> dict:
+        t = super().get_tunables()
+        t["min_edge"] = {
+            "value": self.min_edge, "min": 0.03, "max": 0.20,
+            "selectivity": True,
+            "desc": "model-piyasa arası gereken min edge (düşük=sık, yüksek=seçici)",
+        }
+        return t
+
     def _build_composite_probability(self) -> Optional[float]:
         """
         Build a composite UP probability from multiple indicators.

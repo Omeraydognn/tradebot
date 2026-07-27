@@ -16,6 +16,7 @@ from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
 from config import (
     POLYMARKET_FEE_RATE, PRICE_MIN, PRICE_MAX, NO_TRADE_LAST_SECONDS,
+    FORCE_TRADE_MODE,
 )
 from calibration import Calibrator
 
@@ -283,7 +284,13 @@ class BaseStrategy(ABC):
             bet = self.bet_size
         bet = round(max(1.0, bet), 2)
 
-        if ev > self.min_ev and price_ok and time_ok and window_free:
+        # Zorunlu modda EV eşiği işlemi ENGELLEMEZ — sadece gerçek koruma
+        # bantları (fiyat aralığı, pencere sonu, tek pozisyon) geçerlidir.
+        # Böylece her strateji sonuçlanan işleme sahip olur; kalibratör ve
+        # adapt() gerçek kazanç/kayıptan öğrenebilir.
+        ev_ok = FORCE_TRADE_MODE or (ev > self.min_ev)
+
+        if ev_ok and price_ok and time_ok and window_free:
             trade = self.paper.place_paper_trade(
                 strategy_name=self.name,
                 side=signal.direction,
