@@ -12,6 +12,10 @@ Starts:
 Usage:
   source venv/bin/activate && python main.py
 """
+import os
+import certifi
+os.environ["SSL_CERT_FILE"] = certifi.where()
+
 import asyncio
 import time
 import logging

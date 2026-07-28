@@ -60,7 +60,7 @@ class BaseStrategy(ABC):
         self.total_signals: int = 0
         self.ai_decisions: list[dict] = []  # log of AI-enhanced decisions
         # Adaptif AI bunları outcome'lara göre değiştirir:
-        self.bet_size: float = 10.0   # taban bahis $ (Kelly ile ölçeklenir)
+        self.bet_size: float = 50.0   # taban bahis $ (Kelly ile ölçeklenir)
         self.min_ev: float = 0.02     # işlem için gereken min EV (0.0-0.15 arası)
         self.kelly_fraction: float = 0.25  # fraksiyonel Kelly (0=kapalı, 1=tam Kelly)
         self.last_skip_reason: Optional[str] = None  # neden işlem yapmadı (UI)
@@ -282,7 +282,7 @@ class BaseStrategy(ABC):
         bet = self.kelly_bet_size(signal.confidence, share_price) if self.kelly_fraction > 0 else self.bet_size
         if bet <= 0:
             bet = self.bet_size
-        bet = round(max(1.0, bet), 2)
+        bet = round(max(10.0, bet), 2)
 
         # Zorunlu modda EV eşiği işlemi ENGELLEMEZ — sadece gerçek koruma
         # bantları (fiyat aralığı, pencere sonu, tek pozisyon) geçerlidir.
