@@ -1,1 +1,4 @@
 - [Faz 2] domain: Testere/Yatay Piyasa (Choppy Market) | tech: Feature Flag
+- [Faz 1] domain: VWAP (Volume Weighted Average Price) | tech: Hardware Acceleration (MPS/GPU)
+- [Faz 2] domain: MACD Histogram (Momentum Tükenme) | tech: Single Source of Truth (Dinamik INPUT_SIZE)
+- [Faz 2] domain: Sınıf Dengesizliği (Class Imbalance) piyasa verilerinde | tech: Accuracy Paradox

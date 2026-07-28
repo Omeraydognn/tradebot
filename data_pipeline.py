@@ -45,6 +45,8 @@ FEATURE_COLUMNS = [
     "rsi",               # RSI(14)                         -> aşırı alım/satım
     "atr",               # ATR(14)                         -> volatilite
     "volume",            # hacim                           -> katılım
+    "vwap_distance",     # (close - VWAP) / close          -> hacim-ağırlıklı sapma
+    "macd_hist",         # MACD histogram                  -> momentum tükenme
 ]
 
 # Yardımcı (girdi olmayan) sütunlar — DataFrame'de bulunur, X'e girmez.
@@ -52,7 +54,7 @@ FEATURE_COLUMNS = [
 # flow_imb & taker_buy z-score'un ham kaynağıdır.
 HELPER_COLUMNS = [
     "open", "high", "low", "close", "taker_buy",
-    "flow_imb", "bb_mid", "bb_high", "bb_low",
+    "flow_imb", "bb_mid", "bb_high", "bb_low", "vwap",
 ]
 
 # Hedef: SINIFLANDIRMA etiketi -> 0 (SAT), 1 (BEKLE), 2 (AL)
@@ -187,6 +189,16 @@ def add_indicators(df):
     ma20 = df["close"].rolling(W).mean()
     std20 = df["close"].rolling(W).std()
     df["price_zscore"] = (df["close"] - ma20) / std20
+
+    # VWAP (Hacim Ağırlıklı Ortalama Fiyat) — kümülatif
+    cumvol = df["volume"].cumsum()
+    cumtp = (df["close"] * df["volume"]).cumsum()
+    df["vwap"] = cumtp / cumvol
+    df["vwap_distance"] = (df["close"] - df["vwap"]) / df["close"]
+
+    # MACD Histogram — momentum tükenme sinyali
+    macd_indicator = ta.trend.MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
+    df["macd_hist"] = macd_indicator.macd_diff()
 
     # Order-flow imbalance [-1,1] + 20 mumluk rolling Z-Score (akış aşırılığı)
     df["flow_imb"] = (2 * df["taker_buy"] - df["volume"]) / df["volume"]

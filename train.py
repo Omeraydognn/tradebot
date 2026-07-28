@@ -57,7 +57,12 @@ EPOCHS = 50
 MODEL_PATH = "trade_model.pth"
 SCALER_PATH = "scaler.pkl"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 
 
 def prepare_data():
