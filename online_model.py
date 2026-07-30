@@ -28,22 +28,32 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Modelin kullandığı özellikler ve normalizasyon ölçekleri.
+# Modelin kullandığı özellikler: (isim, normalizasyon ölçeği, çekirdek mi).
 # (değer / ölçek) yaklaşık -1..+1 bandına düşsün diye seçildi.
+#
+# ÇEKİRDEK (core=True) özellikler geçmiş Binance verisinden de üretilebilir;
+# bunlar yoksa örnek güvenilmezdir. Çekirdek olmayanlar (emir defteri,
+# funding, Chainlink…) yalnızca canlı akışta vardır ve eksikse nötr (0)
+# bırakılır — bu, geçmiş veriyle önceden eğitimi (bootstrap) mümkün kılar.
 FEATURE_SPEC = [
-    ("cvd_ratio_60s",       1.0),      # zaten -1..1
-    ("cvd_ratio_300s",      1.0),
-    ("book_imbalance",      1.0),      # zaten -1..1
-    ("funding_rate",        0.0003),   # ±0.03% -> ±1
-    ("basis_pct",           0.05),     # ±0.05% -> ±1
-    ("oi_change_5m",        0.20),     # ±0.2% -> ±1
-    ("momentum_1m",         0.05),     # ±0.05% -> ±1
-    ("momentum_5m",         0.10),
-    ("tf_alignment",        1.0),      # -1..1
-    ("realized_vol",        0.02),
-    ("poly_book_imbalance", 1.0),      # Polymarket'in kendi UP defteri, -1..1
-    ("window_elapsed_frac", 1.0),      # pencerede ne kadar ilerlendiği, -1..1
-    ("outcome_streak",      3.0),      # ardışık UP/DOWN sayısı, ±3 -> ±1
+    ("cvd_ratio_60s",       1.0,     True),   # zaten -1..1
+    ("cvd_ratio_300s",      1.0,     True),
+    ("book_imbalance",      1.0,     False),  # zaten -1..1
+    ("funding_rate",        0.0003,  False),  # ±0.03% -> ±1
+    ("basis_pct",           0.05,    False),  # ±0.05% -> ±1
+    ("oi_change_5m",        0.20,    False),  # ±0.2% -> ±1
+    ("momentum_1m",         0.05,    True),   # ±0.05% -> ±1
+    ("momentum_5m",         0.10,    True),
+    ("tf_alignment",        1.0,     True),   # -1..1
+    ("realized_vol",        0.02,    True),
+    ("poly_book_imbalance", 1.0,     False),  # Polymarket'in kendi UP defteri
+    ("window_elapsed_frac", 1.0,     True),   # pencerede ne kadar ilerlendiği
+    ("outcome_streak",      3.0,     True),   # ardışık UP/DOWN sayısı, ±3 -> ±1
+    # --- Chainlink: piyasanın GERÇEKTEN çözüldüğü fiyat serisi ---
+    # Binance momentumu değil, bu seri belirleyicidir. Modelin doğru
+    # kaynağa bakması, Binance'e bakıp doğru çıkmayı ummasından iyidir.
+    ("cl_momentum_5m",      0.10,    False),  # ±0.10% -> ±1
+    ("cl_window_change",    0.10,    False),  # pencere açılışından bu yana değişim
 ]
 
 MIN_SAMPLES_TO_PREDICT = 25   # bu kadar sonuç görmeden tahmin vermez
@@ -73,17 +83,30 @@ class OnlineLogisticModel:
         if not micro:
             return None
         feats = []
-        missing = 0
-        for key, scale in FEATURE_SPEC:
+        core_total = 0
+        core_missing = 0
+        for key, scale, is_core in FEATURE_SPEC:
+            if is_core:
+                core_total += 1
             v = micro.get(key)
             if v is None:
                 feats.append(0.0)   # nötr
-                missing += 1
+                if is_core:
+                    core_missing += 1
             else:
-                x = float(v) / scale if scale else float(v)
+                try:
+                    x = float(v) / scale if scale else float(v)
+                except (TypeError, ValueError):
+                    feats.append(0.0)
+                    if is_core:
+                        core_missing += 1
+                    continue
                 feats.append(max(-3.0, min(3.0, x)))  # aykırı değer kırpma
-        # Yarıdan fazlası eksikse güvenilmez
-        if missing > len(FEATURE_SPEC) // 2:
+
+        # ÇEKİRDEK özelliklerin yarıdan fazlası eksikse örnek güvenilmez.
+        # (Emir defteri/funding/Chainlink eksikliği örneği geçersiz kılmaz —
+        #  o veriler yalnızca canlı akışta vardır.)
+        if core_missing > core_total // 2:
             return None
         return feats
 
@@ -165,6 +188,7 @@ class OnlineLogisticModel:
     def top_features(self, k: int = 5) -> list:
         """En etkili özellikler (|ağırlık| büyüklüğüne göre) — şeffaflık."""
         pairs = [(FEATURE_SPEC[i][0], self.w[i]) for i in range(len(self.w))]
+
         pairs.sort(key=lambda x: abs(x[1]), reverse=True)
         return [{"feature": n, "weight": round(w, 4)} for n, w in pairs[:k]]
 
@@ -252,10 +276,26 @@ def bootstrap_from_history(model: "OnlineLogisticModel", limit: int = 500) -> in
         return ((2 * r["taker_buy"] - v) / v) if v > 0 else 0.0
 
     learned = 0
+    # Geçmiş pencerelerin yönü — `outcome_streak` özelliğini geçmişten de
+    # üretebilmek için. Sadece i'den ÖNCEKİ mumlara bakılır (sızıntı yok).
+    prior_dirs: list[bool] = []
+
     # i-3'e kadar geçmiş gerektiği için 3'ten başla; son mum kapanmamış olabilir
     for i in range(3, len(rows) - 1):
         prev1, prev2, prev3 = rows[i - 1], rows[i - 2], rows[i - 3]
         cur = rows[i]
+
+        # Ardışık aynı yön sayısı (işaretli): +N = N pencere üst üste UP
+        streak = 0.0
+        if prior_dirs:
+            last = prior_dirs[-1]
+            n = 0
+            for v in reversed(prior_dirs[-20:]):
+                if v == last:
+                    n += 1
+                else:
+                    break
+            streak = float(n if last else -n)
 
         # --- Özellikler: SADECE i'den önceki pencereler ---
         cvd1 = flow_ratio(prev1)
@@ -276,9 +316,15 @@ def bootstrap_from_history(model: "OnlineLogisticModel", limit: int = 500) -> in
             "momentum_5m": mom5,
             "tf_alignment": tf,
             "realized_vol": rvol,
-            # Geçmişi olmayan özellikler nötr bırakılır:
+            "outcome_streak": streak,
+            # Geçmiş veride pencere HENÜZ BAŞLAMIŞTIR (özellikler önceki
+            # mumlardan gelir) -> elapsed_frac = -1, pencere içi değişim = 0.
+            "window_elapsed_frac": -1.0,
+            "cl_window_change": 0.0,
+            # Geçmişi olmayan (yalnızca canlı) özellikler nötr bırakılır:
             "book_imbalance": None, "funding_rate": None,
             "basis_pct": None, "oi_change_5m": None,
+            "poly_book_imbalance": None, "cl_momentum_5m": None,
         }
 
         went_up = cur["close"] >= cur["open"]
@@ -286,6 +332,7 @@ def bootstrap_from_history(model: "OnlineLogisticModel", limit: int = 500) -> in
         model.update(micro, went_up)
         if model.n_updates > before:
             learned += 1
+        prior_dirs.append(went_up)
 
     if learned:
         logger.info(

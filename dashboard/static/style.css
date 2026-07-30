@@ -608,3 +608,134 @@ button.strat-status.active { color: var(--up-color); }
     .trade-row { grid-template-columns: 40px 1fr auto auto; gap: 6px; font-size: 0.72rem; }
     .trade-amt { display: none; }
 }
+
+/* ==================================================================== */
+/*  VERİ BÜTÜNLÜĞÜ PANELİ                                                */
+/*  Sistemin gerçek veriyle çalışıp çalışmadığını tek bakışta gösterir.  */
+/* ==================================================================== */
+.integrity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+}
+.integrity-card {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border-left: 3px solid var(--text-muted);
+}
+.integrity-card.ok   { border-left-color: var(--up-color); }
+.integrity-card.warn { border-left-color: #e0a020; }
+.integrity-card.bad  { border-left-color: var(--down-color); background: rgba(220, 60, 60, 0.07); }
+.ic-label { font-size: 0.78rem; font-weight: 600; }
+.ic-sub   { font-size: 0.66rem; color: var(--text-muted); margin-bottom: 4px; }
+.ic-value { font-size: 1.05rem; font-weight: 700; }
+.ic-note  { font-size: 0.66rem; color: var(--text-muted); margin-top: 2px; }
+
+/* Bot sessizlik nedeni (strateji kartında) */
+.silence-box {
+    margin: 8px 0;
+    padding: 6px 9px;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    background: rgba(224, 160, 32, 0.10);
+    border-left: 3px solid #e0a020;
+    color: #e8c98a;
+}
+
+/* ==================================================================== */
+/*  BOT İŞLEM DEFTERİ                                                    */
+/* ==================================================================== */
+.ledger-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+.ledger-head h2 { margin: 0; }
+.ledger-controls { display: flex; gap: 8px; align-items: center; }
+.ledger-select, .ledger-btn {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-color, #e6e6e6);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 6px;
+    padding: 5px 9px;
+    font-size: 0.78rem;
+    font-family: inherit;
+    cursor: pointer;
+}
+.ledger-btn:hover, .ledger-select:hover { background: rgba(255, 255, 255, 0.12); }
+
+.ledger-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 0.76rem;
+}
+.lg-stat { color: var(--text-muted); }
+.lg-stat b { color: var(--text-color, #e6e6e6); }
+.lg-warn {
+    color: #e8c98a;
+    background: rgba(224, 160, 32, 0.12);
+    padding: 2px 7px;
+    border-radius: 5px;
+}
+
+/* Geniş tablo: yatay kaydırma tablonun KENDİ içinde kalır, sayfa kaymaz */
+.ledger-table-wrap { overflow-x: auto; max-height: 460px; overflow-y: auto; }
+#ledger-table { width: 100%; border-collapse: collapse; font-size: 0.72rem; white-space: nowrap; }
+#ledger-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #14161c;
+    text-align: left;
+    padding: 7px 8px;
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+}
+#ledger-table td { padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+.lg-row:hover { background: rgba(255, 255, 255, 0.04); }
+.lg-row.win  { box-shadow: inset 2px 0 0 var(--up-color); }
+.lg-row.lose { box-shadow: inset 2px 0 0 var(--down-color); }
+.lg-row.pending { box-shadow: inset 2px 0 0 #888; }
+
+.side-UP   { color: var(--up-color); font-weight: 600; }
+.side-DOWN { color: var(--down-color); font-weight: 600; }
+.result-win     { color: var(--up-color); font-weight: 600; }
+.result-lose    { color: var(--down-color); font-weight: 600; }
+.result-pending { color: #999; font-weight: 600; }
+
+/* İleri pencereye açılan işlem — gerçeklik uyarısı */
+.lg-future {
+    color: #e8c98a;
+    background: rgba(224, 160, 32, 0.15);
+    padding: 1px 5px;
+    border-radius: 4px;
+}
+/* Likiditenin bahsi kıstığı işlem */
+.lg-capped { color: #e8c98a; }
+
+.lg-reason {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+
+/* Erken çıkış etiketi (işlem defteri) */
+.lg-exit {
+    color: #7fd4ff;
+    background: rgba(80, 170, 255, 0.13);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-weight: 600;
+}

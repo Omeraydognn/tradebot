@@ -15,6 +15,8 @@ import numpy as np
 import websockets
 from polymarket import AsyncPublicClient, PRODUCTION
 
+from chainlink_feed import ChainlinkPriceFeed
+
 logger = logging.getLogger(__name__)
 
 # Polymarket 5 dakikalık BTC piyasa slug öneki: btc-updown-5m-<5dk-hizalı-unix>
@@ -48,6 +50,24 @@ class PolymarketSnapshot:
     timestamp: float = 0.0
     window_start: int = 0    # 5dk pencerenin başlangıcı (unix) — resolution için
     window_end: int = 0      # 5dk pencerenin sonu (unix) — trade bu anda çözülür
+    # Bu snapshot ŞU ANKİ pencereye mi ait, yoksa ileri bir pencereye mi?
+    # 0 = şu an oynanan pencere, 1 = bir sonraki (henüz başlamamış), …
+    window_offset: int = 0
+
+    @property
+    def is_current_window(self) -> bool:
+        """Snapshot gerçekten ŞU AN açık olan 5dk penceresine mi ait?"""
+        now = int(time.time())
+        return self.window_start == now - (now % 300)
+
+    @property
+    def window_label(self) -> str:
+        """İnsan okunur pencere etiketi: '21:45–21:50' gibi."""
+        if not self.window_start:
+            return "?"
+        s = time.strftime("%H:%M", time.localtime(self.window_start))
+        e = time.strftime("%H:%M", time.localtime(self.window_start + 300))
+        return f"{s}–{e}"
 
     @property
     def up_payout(self) -> float:
@@ -75,6 +95,169 @@ class PolymarketSnapshot:
                 return best_ask
         return mid
 
+    def simulate_fill(self, side: str, usd: float) -> dict:
+        """
+        DEFTER DERİNLİĞİNE GÖRE GERÇEK DOLUM SİMÜLASYONU.
+
+        NEDEN ZORUNLU (sahte kârın asıl kaynağı buydu):
+          Önceki hâlde `executable_price()` defterin EN İYİ ask'ini döndürüyor,
+          paper trader da o fiyattan SINIRSIZ hisse alabiliyordu. Gerçekte en
+          iyi seviyede belki 40 hisse vardır; 800 hisselik emir defteri
+          yukarı yürür ve ortalama maliyet çok daha kötü olur.
+
+          En iyi ask $0.25'ten 800 hisse almak = kazanınca +%300. Bu, sistemin
+          bir günde $1000 -> $3500 yapmasının matematiksel açıklamasıdır ve
+          gerçek piyasada MÜMKÜN DEĞİLDİR.
+
+        Bu fonksiyon emri defterde seviye seviye yürütür ve gerçekten
+        ödenecek AĞIRLIKLI ORTALAMA fiyatı döndürür. Likidite yetmezse
+        `filled_usd < usd` olur ve `insufficient=True` işaretlenir.
+
+        Dönüş:
+          {avg_price, shares, filled_usd, requested_usd, levels_used,
+           insufficient, slippage_bps, top_price, book_depth_usd}
+        """
+        asks = self.up_book_asks if side == "UP" else self.down_book_asks
+        mid = self.up_price if side == "UP" else self.down_price
+
+        empty = {
+            "avg_price": None, "shares": 0.0, "filled_usd": 0.0,
+            "requested_usd": round(usd, 2), "levels_used": 0,
+            "insufficient": True, "slippage_bps": None,
+            "top_price": None, "book_depth_usd": 0.0,
+        }
+
+        if usd <= 0:
+            return empty
+
+        # Defter yoksa dolum simüle EDİLEMEZ. Uydurma fiyat üretmek yerine
+        # bunu açıkça bildiriyoruz; çağıran işlemi atlamalı.
+        if not asks:
+            out = dict(empty)
+            out["avg_price"] = mid if 0.0 < mid < 1.0 else None
+            out["no_book"] = True
+            return out
+
+        levels = sorted(((float(p), float(q)) for p, q in asks if 0.0 < p < 1.0),
+                        key=lambda x: x[0])
+        if not levels:
+            return empty
+
+        top_price = levels[0][0]
+        book_depth_usd = sum(p * q for p, q in levels)
+
+        remaining = float(usd)
+        shares = 0.0
+        spent = 0.0
+        used = 0
+
+        for price, size in levels:
+            if remaining <= 1e-9:
+                break
+            level_usd = price * size
+            take_usd = min(remaining, level_usd)
+            shares += take_usd / price
+            spent += take_usd
+            remaining -= take_usd
+            used += 1
+
+        if shares <= 0:
+            return empty
+
+        avg_price = spent / shares
+        return {
+            "avg_price": avg_price,
+            "shares": shares,
+            "filled_usd": spent,
+            "requested_usd": round(usd, 2),
+            "levels_used": used,
+            "insufficient": remaining > 0.01,
+            "slippage_bps": (avg_price - top_price) / top_price * 10000.0 if top_price > 0 else None,
+            "top_price": top_price,
+            "book_depth_usd": book_depth_usd,
+        }
+
+    def simulate_sell(self, side: str, shares: float) -> dict:
+        """
+        ERKEN ÇIKIŞ (pozisyon satışı) — BID tarafını yürüterek.
+
+        Alırken ask'i yeriz, SATARKEN bid'i yeriz. Bu simetri gerçek
+        maliyetin iki ucudur: aynı anda hem alıp hem satsak spread kadar
+        zarar ederiz. Erken çıkışın bedeli budur.
+
+        Kaybeden bir pozisyonda bid genelde çok aşağıdadır — "ne kurtarırsak
+        kâr" tam olarak burada ölçülür: elimizdeki hisseleri gerçekten kaç
+        dolara çevirebiliriz.
+
+        Dönüş:
+          {avg_price, shares_sold, proceeds_usd, levels_used, insufficient,
+           top_bid, slippage_bps, book_depth_shares}
+        """
+        bids = self.up_book_bids if side == "UP" else self.down_book_bids
+
+        empty = {
+            "avg_price": None, "shares_sold": 0.0, "proceeds_usd": 0.0,
+            "requested_shares": round(shares, 4), "levels_used": 0,
+            "insufficient": True, "top_bid": None, "slippage_bps": None,
+            "book_depth_shares": 0.0,
+        }
+
+        if shares <= 0 or not bids:
+            return empty
+
+        # Satarken en YÜKSEK bid'den başlarız (bize en iyisi)
+        levels = sorted(((float(p), float(q)) for p, q in bids if 0.0 < p < 1.0),
+                        key=lambda x: x[0], reverse=True)
+        if not levels:
+            return empty
+
+        top_bid = levels[0][0]
+        depth_shares = sum(q for _, q in levels)
+
+        remaining = float(shares)
+        sold = 0.0
+        proceeds = 0.0
+        used = 0
+
+        for price, size in levels:
+            if remaining <= 1e-9:
+                break
+            take = min(remaining, size)
+            sold += take
+            proceeds += take * price
+            remaining -= take
+            used += 1
+
+        if sold <= 0:
+            return empty
+
+        avg_price = proceeds / sold
+        return {
+            "avg_price": avg_price,
+            "shares_sold": sold,
+            "proceeds_usd": proceeds,
+            "requested_shares": round(shares, 4),
+            "levels_used": used,
+            # Tüm pozisyonu satamadıysak: dar defterde sıkışmışız demektir
+            "insufficient": remaining > 1e-6,
+            "top_bid": top_bid,
+            # Satışta kayma NEGATİF yönde: ortalama, en iyi bid'in ALTINDA kalır
+            "slippage_bps": (top_bid - avg_price) / top_bid * 10000.0 if top_bid > 0 else None,
+            "book_depth_shares": depth_shares,
+        }
+
+    def mark_price(self, side: str) -> Optional[float]:
+        """
+        Pozisyonun ANLIK piyasa değeri (en iyi bid) — şu an satsak kaç eder.
+        Erken çıkış kararları bu fiyata bakar; midpoint iyimser olur çünkü
+        satarken midpoint'i alamayız.
+        """
+        bids = self.up_book_bids if side == "UP" else self.down_book_bids
+        if not bids:
+            return None
+        best = max((float(p) for p, _ in bids if 0.0 < p < 1.0), default=None)
+        return best
+
 
 class MarketDataService:
     """
@@ -98,9 +281,21 @@ class MarketDataService:
         self.window_last_up_price: dict[int, float] = {}
         # 5dk pencere -> Polymarket'in RESMİ sonucu ("UP"/"DOWN"). Tek doğru kaynak.
         self.window_official_outcome: dict[int, str] = {}
-        # 5dk pencere -> pencere BAŞINDAKİ mikroyapı (online model bunu öğrenir;
-        # ileriye bakış yok: sadece pencere başında bilinen bilgi)
-        self.window_micro: dict[int, dict] = {}
+        # 5dk pencere -> o pencere İÇİNDE alınmış mikroyapı örnekleri listesi.
+        #
+        # NEDEN LİSTE (train/serve uyumu):
+        #   Eskiden sadece pencere BAŞINDA tek örnek alınıyordu. Ama canlı
+        #   strateji pencerenin ORTASINDA tahmin ister. "Pencerede ne kadar
+        #   ilerledik" ve "pencere şu ana dek ne kadar hareket etti" gibi
+        #   özellikler eğitimde hep aynı (başlangıç) değerdeyken serviste
+        #   değişken olurdu — model öğrendiğinden farklı bir dünyada tahmin
+        #   yapardı. Şimdi pencere boyunca örnek alınır ve hepsi AYNI
+        #   sonuçla etiketlenir; model tam olarak soracağı soruyu öğrenir.
+        #
+        #   İleriye bakış YOK: her örnek yalnızca o an bilinen bilgiyi taşır,
+        #   etiket ise pencere kapandıktan sonra resmi kaynaktan gelir.
+        self.window_micro: dict[int, list] = {}
+        self._last_micro_sample_at: float = 0.0
 
         # Internal state for kline building
         self._current_kline_start: float = 0.0
@@ -133,6 +328,13 @@ class MarketDataService:
         # pencereler eklenir, bu yüzden bir sonraki tahmin için ileriye
         # bakış riski yoktur.
         self.window_outcomes: deque = deque(maxlen=20)  # bool (went_up)
+
+        # CHAINLINK — Polymarket'in RESOLUTION kaynağı.
+        # Binance fiyatı işlem akışı/CVD için hâlâ gerekli (Chainlink'te
+        # order flow yok) ama "pencere yukarı mı kapandı?" sorusunun
+        # cevabı Chainlink'e göre belirlenir. İkisi arasındaki fark
+        # ölçülür ve dashboard'da açıkça gösterilir.
+        self.chainlink = ChainlinkPriceFeed(poll_interval=10.0)
 
     # ------------------------------------------------------------------ #
     #  Binance WebSocket — real-time BTC/USDT trades + kline building     #
@@ -575,6 +777,32 @@ class MarketDataService:
         frac = max(0.0, min(1.0, frac))
         return float(frac * 2 - 1)
 
+    def sample_window_micro(self, min_gap_sec: float = 25.0) -> bool:
+        """
+        ŞU ANKİ pencere için bir mikroyapı örneği kaydeder.
+
+        Pencere boyunca ~her 30 saniyede bir çağrılır; böylece tek pencereden
+        ~10 eğitim örneği çıkar. Bu hem train/serve uyumunu sağlar hem de
+        modelin öğrenme hızını belirgin biçimde artırır (5dk'da 1 örnek
+        yerine 10 örnek).
+
+        Dönüş: örnek alındıysa True.
+        """
+        now = time.time()
+        if now - self._last_micro_sample_at < min_gap_sec:
+            return False
+
+        w = int(now) - (int(now) % 300)
+        samples = self.window_micro.setdefault(w, [])
+        if len(samples) >= 12:      # pencere başına üst sınır (bellek)
+            return False
+
+        snap = self.microstructure_snapshot()
+        snap["_sampled_at"] = now
+        samples.append(snap)
+        self._last_micro_sample_at = now
+        return True
+
     def record_window_outcome(self, went_up: bool):
         """Bir pencere resmi olarak çözüldüğünde çağrılır (streak takibi için)."""
         self.window_outcomes.append(bool(went_up))
@@ -596,6 +824,25 @@ class MarketDataService:
                 break
         return float(streak if last else -streak)
 
+    def calc_chainlink_divergence_bps(self) -> Optional[float]:
+        """
+        Binance ile Chainlink arasındaki anlık fark (bps).
+        Bu değer büyüdükçe Binance'e bakarak yön tahmin etmek riskleşir —
+        çünkü piyasa Chainlink'e göre çözülür.
+        """
+        if not self.chainlink.is_live or self.latest_btc_price <= 0:
+            return None
+        return self.chainlink.divergence_bps(self.latest_btc_price)
+
+    def calc_chainlink_window_change(self) -> Optional[float]:
+        """
+        ŞU ANKİ pencerede Chainlink'e göre yüzde değişim.
+        "Pencere şu an yukarı mı?" sorusunun resolution ile hizalı cevabı.
+        """
+        now = int(time.time())
+        w = now - (now % 300)
+        return self.chainlink.window_change_pct(w)
+
     def microstructure_snapshot(self) -> dict:
         """Tüm mikroyapı göstergelerini tek sözlükte döndürür (AI + dashboard)."""
         return {
@@ -615,6 +862,10 @@ class MarketDataService:
             "poly_book_imbalance": self.calc_poly_book_imbalance(5),
             "window_elapsed_frac": self.calc_window_elapsed_frac(),
             "outcome_streak": self.calc_outcome_streak(),
+            # --- Chainlink (Polymarket'in çözüm kaynağı) ---
+            "cl_momentum_5m": self.chainlink.momentum_pct(300),
+            "cl_window_change": self.calc_chainlink_window_change(),
+            "cl_divergence_bps": self.calc_chainlink_divergence_bps(),
         }
 
     # ------------------------------------------------------------------ #
@@ -721,9 +972,20 @@ class MarketDataService:
                 logger.debug("Aktif BTC 5m piyasası bulunamadı (bu döngü).")
                 return
 
-            # Şu anki pencereyi tercih et (slugs[0]); yoksa ilk bulunanı al
+            # Şu anki pencereyi tercih et (slugs[0]); yoksa ilk bulunanı al.
+            # slugs[0] = şu an oynanan pencere, slugs[1] = bir SONRAKİ pencere.
+            # Hangisine düştüğümüzü kaydediyoruz: ileri pencereye işlem
+            # açılırsa bu, işlem kaydında ve arayüzde AÇIKÇA görünmeli.
             by_slug = {getattr(e, "slug", ""): e for e in events}
             target_ev = next((by_slug[s] for s in slugs if s in by_slug), events[0])
+            picked_slug = getattr(target_ev, "slug", "") or ""
+            window_offset = slugs.index(picked_slug) if picked_slug in slugs else -1
+            if window_offset != 0:
+                logger.warning(
+                    f"⚠️  Şu anki 5dk piyasası bulunamadı; {picked_slug} kullanılıyor "
+                    f"(offset={window_offset}). Bu pencereye açılan işlemler "
+                    f"'İLERİ PENCERE' olarak işaretlenecek."
+                )
 
             market = (getattr(target_ev, "markets", None) or [None])[0]
             if market is None:
@@ -755,8 +1017,6 @@ class MarketDataService:
                     open_px = self.latest_btc_price  # yedek
                 if open_px:
                     self.window_open_price[window_start] = open_px
-                # Pencere başındaki mikroyapıyı dondur (online modelin girdisi)
-                self.window_micro[window_start] = self.microstructure_snapshot()
             # Eski pencereleri buda (bellek): 1 saatten eski
             cutoff = int(time.time()) - 3600
             self.window_open_price = {
@@ -807,6 +1067,7 @@ class MarketDataService:
                 timestamp=time.time(),
                 window_start=window_start,
                 window_end=window_end,
+                window_offset=window_offset,
             )
             logger.info(
                 f"📊 Polymarket: {getattr(target_ev, 'slug', '?')} | "
@@ -833,11 +1094,12 @@ class MarketDataService:
             try:
                 now = int(time.time())
                 w = now - (now % 300)   # şu anki 5dk penceresi
-                if w not in self.window_micro:
-                    open_px = self.kline_open_at(w) or self.latest_btc_price
-                    if open_px:
-                        self.window_open_price.setdefault(w, open_px)
-                        self.window_micro[w] = self.microstructure_snapshot()
+                open_px = self.kline_open_at(w) or self.latest_btc_price
+                if open_px:
+                    self.window_open_price.setdefault(w, open_px)
+                # Pencere boyunca örnek topla (tek örnek değil — bkz.
+                # sample_window_micro: train/serve uyumu + 10x eğitim verisi)
+                self.sample_window_micro()
             except Exception as e:
                 logger.debug(f"window tracker hatası: {e}")
             await asyncio.sleep(10)
@@ -852,6 +1114,7 @@ class MarketDataService:
         asyncio.create_task(self.liquidation_loop())       # likidasyonlar (opsiyonel)
         asyncio.create_task(self.open_interest_loop())     # açık pozisyon
         asyncio.create_task(self.window_tracker_loop())    # 5dk pencere takibi (öğrenme için)
+        asyncio.create_task(self.chainlink.poll_loop())    # Chainlink = resolution kaynağı
         while True:
             await self.fetch_polymarket_data()
             await asyncio.sleep(15)  # refresh Polymarket data every 15s

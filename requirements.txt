@@ -8,3 +8,6 @@ google-genai==2.14.0
 python-dotenv==1.2.2
 ccxt==4.5.66
 numpy==2.5.1
+# Durum kalıcılığı (Render'ın dosya sistemi ephemeral — bkz. persistence.py).
+# DATABASE_URL verilmezse kullanılmaz; sistem dosyaya düşer.
+psycopg[binary]==3.2.12

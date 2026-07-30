@@ -16,7 +16,7 @@ from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
 from config import (
     POLYMARKET_FEE_RATE, PRICE_MIN, PRICE_MAX, NO_TRADE_LAST_SECONDS,
-    FORCE_TRADE_MODE,
+    FORCE_TRADE_MODE, ALLOW_FUTURE_WINDOW_TRADES,
 )
 from calibration import Calibrator
 
@@ -67,6 +67,20 @@ class BaseStrategy(ABC):
         # Güven kalibrasyonu: ham güveni gerçek isabetle hizalar
         self.calibrator = Calibrator(name)
 
+        # --- ERKEN ÇIKIŞ POLİTİKASI ---
+        # Pozisyonun anlık değeri (en iyi bid) girişin bu oranının ALTINA
+        # düşerse sat: "ne kurtarırsak kâr". 0.55'ten alıp bid 0.28'e
+        # düştüyse (%50) beklemek yerine maliyetin yarısını kurtarırız.
+        self.stop_loss_ratio: float = 0.50
+        # Bid girişin bu katına ÇIKTIYSA kârı kilitle. Pencere sonuna kadar
+        # ters dönme riskini almaktansa kesinleşmiş kârı al.
+        self.take_profit_ratio: float = 1.60
+        # Çıkışın anlamlı olması için pencerede en az bu kadar saniye kalmalı
+        # (son saniyelerde satmak zaten çözülmeyi beklemekle aynı şey).
+        self.min_seconds_to_exit: float = 45.0
+        self.early_exits: int = 0
+        self.exit_blocked_count: int = 0
+
     @abstractmethod
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
         """
@@ -90,6 +104,10 @@ class BaseStrategy(ABC):
                        "desc": "işlem için gereken minimum EV"},
             "kelly_fraction": {"value": self.kelly_fraction, "min": 0.0, "max": 0.5,
                                "desc": "fraksiyonel Kelly katsayısı"},
+            "stop_loss_ratio": {"value": self.stop_loss_ratio, "min": 0.0, "max": 0.90,
+                                "desc": "bid girişin bu oranına düşerse sat (0=kapalı)"},
+            "take_profit_ratio": {"value": self.take_profit_ratio, "min": 1.0, "max": 3.0,
+                                  "desc": "bid girişin bu katına çıkarsa kârı kilitle"},
         }
 
     def set_tunables(self, values: dict):
@@ -270,13 +288,20 @@ class BaseStrategy(ABC):
         }
 
         # --- KORUMA BANTLARI (guardrails) ---
-        # 1) Aşırı fiyat: $0.10-$0.90 dışında işlem yok (sonuç neredeyse belli).
+        # 1) Aşırı fiyat: PRICE_MIN-PRICE_MAX dışında işlem yok.
         # 2) Pencere sonu: son NO_TRADE_LAST_SECONDS sn içinde yeni işlem yok.
         # 3) Pencere başına tek pozisyon (aynı 5dk'da yığılma yok).
+        # 4) PENCERE DOĞRULUĞU: varsayılan olarak SADECE şu an oynanan 5dk
+        #    penceresine işlem açılır. Polymarket'in aktif piyasası
+        #    bulunamayıp bir SONRAKİ pencereye düşüldüyse (window_offset>0),
+        #    o pencere henüz başlamamıştır: mikroyapı verimiz o pencereye ait
+        #    değildir, yani sinyalimizin hiçbir geçerliliği yoktur.
         time_left = (snapshot.window_end - time.time()) if snapshot.window_end else 999.0
         price_ok = PRICE_MIN <= share_price <= PRICE_MAX
         time_ok = time_left >= NO_TRADE_LAST_SECONDS
         window_free = not self.has_position_in_window(snapshot.window_start)
+        window_current = (snapshot.window_offset == 0) and snapshot.is_current_window
+        window_ok = window_current or ALLOW_FUTURE_WINDOW_TRADES
 
         # Kelly ile bahis boyutu (edge büyüdükçe artar)
         bet = self.kelly_bet_size(signal.confidence, share_price) if self.kelly_fraction > 0 else self.bet_size
@@ -284,38 +309,68 @@ class BaseStrategy(ABC):
             bet = self.bet_size
         bet = round(max(10.0, bet), 2)
 
+        # GERÇEK DOLUM: emir defterini seviye seviye yürüterek gerçekten
+        # ödenecek ortalama fiyatı ve alınabilecek hisse adedini bul.
+        fill = snapshot.simulate_fill(signal.direction, bet)
+        fill_ok = bool(fill.get("shares", 0) > 0 and fill.get("avg_price"))
+        decision["fill"] = {
+            "avg_price": round(fill["avg_price"], 4) if fill.get("avg_price") else None,
+            "shares": round(fill.get("shares") or 0.0, 2),
+            "levels_used": fill.get("levels_used", 0),
+            "slippage_bps": round(fill["slippage_bps"], 1) if fill.get("slippage_bps") is not None else None,
+            "liquidity_capped": bool(fill.get("insufficient")),
+            "book_depth_usd": round(fill.get("book_depth_usd") or 0.0, 2),
+        }
+        decision["window_label"] = snapshot.window_label
+        decision["window_offset"] = snapshot.window_offset
+        decision["is_current_window"] = window_current
+
         # Zorunlu modda EV eşiği işlemi ENGELLEMEZ — sadece gerçek koruma
-        # bantları (fiyat aralığı, pencere sonu, tek pozisyon) geçerlidir.
-        # Böylece her strateji sonuçlanan işleme sahip olur; kalibratör ve
-        # adapt() gerçek kazanç/kayıptan öğrenebilir.
+        # bantları (fiyat aralığı, pencere sonu, tek pozisyon, pencere
+        # doğruluğu) geçerlidir. Bunlar gerçeklikle ilgilidir, iştahla değil.
         ev_ok = FORCE_TRADE_MODE or (ev > self.min_ev)
 
-        if ev_ok and price_ok and time_ok and window_free:
+        if ev_ok and price_ok and time_ok and window_free and window_ok and fill_ok:
+            cl = self.data.chainlink
             trade = self.paper.place_paper_trade(
                 strategy_name=self.name,
                 side=signal.direction,
-                share_price=share_price,
                 bet_amount=bet,
+                fill=fill,
                 market_window=snapshot.window_start,
                 resolve_at=snapshot.window_end,
                 raw_confidence=raw_conf,
                 calibrated_confidence=signal.confidence,
+                window_offset=snapshot.window_offset,
+                mid_price=mid_price,
+                ev=ev,
+                reasoning=signal.reasoning,
+                ai_initiated=ai_initiated,
+                btc_price_at_entry=self.data.latest_btc_price,
+                chainlink_at_entry=cl.price if cl.is_live else 0.0,
+                cl_divergence_bps=self.data.calc_chainlink_divergence_bps() or 0.0,
             )
             if trade:
                 self.last_skip_reason = None
                 decision["action"] = "TRADE"
                 decision["trade"] = trade.to_dict()
                 logger.info(
-                    f"🎯 [{self.name}] {signal.direction} | Conf: {signal.confidence:.0%} | "
-                    f"Share: ${share_price:.2f} | Bet: ${bet:.2f} | EV: ${ev:+.3f} | {signal.reasoning}"
+                    f"🎯 [{self.name}] {signal.direction} {trade.window_label} | "
+                    f"Conf: {signal.confidence:.0%} | Dolum: ${trade.entry_price:.4f} | "
+                    f"Bahis: ${trade.amount:.2f} | EV: ${ev:+.3f} | {signal.reasoning}"
                 )
         else:
-            if not window_free:
+            if not window_ok:
+                reason = (f"ileri pencereye işlem yok "
+                          f"({snapshot.window_label}, offset +{snapshot.window_offset})")
+            elif not window_free:
                 reason = "bu pencerede zaten pozisyon var"
             elif not price_ok:
                 reason = f"fiyat uçta (${share_price:.2f})"
             elif not time_ok:
                 reason = f"pencere sonu ({time_left:.0f}s kaldı)"
+            elif not fill_ok:
+                reason = "emir defteri boş — gerçek dolum simüle edilemiyor"
             else:
                 reason = f"EV düşük (${ev:+.3f} < {self.min_ev:.2f})"
             self.last_skip_reason = reason
@@ -329,12 +384,79 @@ class BaseStrategy(ABC):
 
         return decision
 
+    def check_early_exits(self, snapshot: PolymarketSnapshot) -> int:
+        """
+        AÇIK POZİSYONLARI GÖZDEN GEÇİR — erken çıkış gerekiyor mu?
+
+        Pozisyonun anlık değeri, onu ŞU AN satabileceğimiz fiyattır: en iyi
+        BID. Midpoint kullanmak iyimserlik olurdu, çünkü satarken midpoint'i
+        alamayız.
+
+        İki kural:
+          1) STOP-LOSS: bid, girişin `stop_loss_ratio` katının altına düştüyse
+             sat. Kaybeden pozisyonda pencere sonunu beklemek %100 kayıptır;
+             şimdi satmak ne kurtarırsak onu kâr yazar.
+          2) KÂR KİLİTLEME: bid, girişin `take_profit_ratio` katına çıktıysa
+             sat. Kesinleşmiş kârı, ters dönme riskine tercih ederiz.
+
+        Yalnızca bu snapshot'ın penceresine ait pozisyonlara bakar — başka
+        pencerenin defteriyle fiyatlama yapmak yanlış olurdu.
+
+        Dönüş: kapatılan pozisyon sayısı.
+        """
+        portfolio = self.paper.portfolios.get(self.name)
+        if not portfolio or not portfolio.pending_trades:
+            return 0
+        if not snapshot or not snapshot.window_start:
+            return 0
+
+        time_left = (snapshot.window_end - time.time()) if snapshot.window_end else 0.0
+        if time_left < self.min_seconds_to_exit:
+            return 0   # bu kadar az kalmışken satmak ile beklemek aynı şey
+
+        closed = 0
+        for trade in list(portfolio.pending_trades):
+            # Sadece AYNI pencerenin pozisyonları bu defterle fiyatlanabilir
+            if trade.market_window != snapshot.window_start:
+                continue
+
+            bid = snapshot.mark_price(trade.side)
+            if bid is None or trade.entry_price <= 0:
+                continue
+
+            ratio = bid / trade.entry_price
+            reason = None
+            if self.stop_loss_ratio > 0 and ratio <= self.stop_loss_ratio:
+                reason = (f"stop-loss: bid ${bid:.4f} girişin %{ratio*100:.0f}'ine "
+                          f"düştü (eşik %{self.stop_loss_ratio*100:.0f})")
+            elif self.take_profit_ratio > 1.0 and ratio >= self.take_profit_ratio:
+                reason = (f"kâr kilitleme: bid ${bid:.4f} girişin %{ratio*100:.0f}'i "
+                          f"(eşik %{self.take_profit_ratio*100:.0f})")
+
+            if reason is None:
+                continue
+
+            sell = snapshot.simulate_sell(trade.side, trade.shares)
+            if self.paper.close_trade_early(trade, sell, reason):
+                self.early_exits += 1
+                closed += 1
+            else:
+                # Çıkamadık — dar defterde sıkıştık. Bu gerçek bir risktir.
+                self.exit_blocked_count += 1
+                logger.warning(
+                    f"🔒 [{self.name}] çıkış ENGELLENDİ {trade.side} "
+                    f"{trade.window_label}: {trade.exit_blocked_reason}"
+                )
+        return closed
+
     def get_status(self) -> dict:
         """Return strategy status for dashboard."""
         portfolio = self.paper.portfolios.get(self.name)
         return {
             "name": self.name,
             "is_active": self.is_active,
+            # Strateji HİÇ sinyal üretmiyorsa nedeni ("bot dondu mu?" cevabı)
+            "silence_reason": getattr(self, "silence_reason", None),
             "total_signals": self.total_signals,
             "last_signal": {
                 "direction": self.last_signal.direction,
@@ -346,6 +468,10 @@ class BaseStrategy(ABC):
             "min_ev": round(self.min_ev, 3),
             "kelly_fraction": round(self.kelly_fraction, 3),
             "last_skip_reason": self.last_skip_reason,
+            "early_exits": self.early_exits,
+            "exit_blocked_count": self.exit_blocked_count,
+            "stop_loss_ratio": round(self.stop_loss_ratio, 3),
+            "take_profit_ratio": round(self.take_profit_ratio, 3),
             "calibration": self.calibrator.to_dict(),
             "tunables": self.get_tunables(),
             "portfolio": portfolio.to_dict() if portfolio else None,

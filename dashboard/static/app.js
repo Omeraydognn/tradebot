@@ -278,10 +278,14 @@ function renderDashboard(data) {
         updateTicker('pm-down-price', data.polymarket.down_price);
     }
 
-    // 1b. Mikroyapı, öğrenen model ve birleşik equity curve
+    // 1b. Veri bütünlüğü, mikroyapı, öğrenen model ve birleşik equity curve
+    renderIntegrity(data.integrity, data.polymarket, data.persistence);
     renderMicro(data.microstructure);
     renderModel(data.online_model);
     renderEquityChart(data.strategies);
+
+    // 1c. Bot işlem defteri (bot listesi ilk yüklemede kurulur)
+    loadLedgerBots(data.strategies);
 
     // 2. Strategies Grid
     const grid = document.getElementById('strategies-grid');
@@ -333,6 +337,10 @@ function renderDashboard(data) {
                         <span class="win-rate-val monospace">${port.win_rate.toFixed(1)}%</span>
                     </div>
                 </div>
+                ${strat.silence_reason ? `
+                <div class="silence-box" title="Bu bot şu anda neden hiç sinyal üretmiyor">
+                    🔇 Sessiz: ${strat.silence_reason}
+                </div>` : ''}
                 ${strat.persona ? `
                 <div class="persona-box">
                     <div class="persona-head">
@@ -542,8 +550,253 @@ function updateTicker(elementId, newValue, isCurrency = false) {
     }, 1000);
 }
 
+// ==================================================================== //
+//  VERİ BÜTÜNLÜĞÜ PANELİ                                               //
+//  Sistemin gerçek veriyle çalışıp çalışmadığını gösterir. Bir kaynak   //
+//  düştüğünde veya kaynaklar ayrıştığında bunu SAKLAMAZ — kırmızı yanar.//
+// ==================================================================== //
+function renderIntegrity(integrity, poly, persistence) {
+    const grid = document.getElementById('integrity-grid');
+    if (!grid || !integrity) return;
+
+    const cl = integrity.chainlink || {};
+    const cards = [];
+
+    // 0) KALICILIK — deploy'dan sağ çıkacak mı? En kritik kart, en başta.
+    if (persistence && persistence.backend) {
+        const durable = persistence.durable;
+        const saveAgo = persistence.last_save_ago_sec;
+        cards.push({
+            label: durable ? 'Kalıcılık: Postgres' : 'Kalıcılık: SADECE DOSYA',
+            sub: durable ? 'deploy\'dan sağ çıkar' : 'bulutta deploy\'da SİLİNİR',
+            value: persistence.loaded
+                ? `${persistence.restored_trades} işlem geri geldi`
+                : 'temiz başladı',
+            note: saveAgo != null
+                ? `son kayıt ${saveAgo.toFixed(0)}s önce · ${persistence.save_count} kayıt`
+                : 'henüz kaydedilmedi',
+            state: durable ? 'ok' : 'bad',
+        });
+    }
+
+    // 1) Chainlink — resolution kaynağı
+    cards.push({
+        label: 'Chainlink BTC/USD',
+        sub: 'Polymarket bununla çözer',
+        value: cl.price != null ? `$${cl.price.toLocaleString('en-US', {minimumFractionDigits: 2})}` : 'YOK',
+        note: cl.is_live ? `${cl.feed} · ${cl.age_sec != null ? cl.age_sec.toFixed(0) : '?'}s` : 'bağlantı yok',
+        state: cl.is_live ? 'ok' : 'bad',
+    });
+
+    // 2) Binance — order flow kaynağı
+    cards.push({
+        label: 'Binance spot',
+        sub: 'order flow / CVD kaynağı',
+        value: integrity.binance_price ? `$${integrity.binance_price.toLocaleString('en-US', {minimumFractionDigits: 2})}` : 'YOK',
+        note: 'karar için tek başına yetmez',
+        state: integrity.binance_price ? 'ok' : 'bad',
+    });
+
+    // 3) Ayrışma — asıl risk göstergesi
+    const dbps = integrity.divergence_bps;
+    let divState = 'ok';
+    if (dbps == null) divState = 'bad';
+    else if (Math.abs(dbps) > 15) divState = 'bad';
+    else if (Math.abs(dbps) > 6) divState = 'warn';
+    cards.push({
+        label: 'Kaynak ayrışması',
+        sub: 'Binance − Chainlink',
+        value: dbps != null ? `${dbps > 0 ? '+' : ''}${dbps.toFixed(1)} bps` : '—',
+        note: integrity.divergence_usd != null
+            ? `${integrity.divergence_usd > 0 ? '+' : ''}$${integrity.divergence_usd.toFixed(2)}`
+            : 'ölçülemiyor',
+        state: divState,
+    });
+
+    // 4) Pencere doğruluğu
+    cards.push({
+        label: 'Oynanan pencere',
+        sub: poly && poly.window_label ? poly.window_label : '5dk',
+        value: integrity.window_ok ? 'ŞU ANKİ' : 'İLERİ PENCERE',
+        note: poly && poly.seconds_left != null ? `${poly.seconds_left}s kaldı` : '—',
+        state: integrity.window_ok ? 'ok' : 'bad',
+    });
+
+    // 5) Emir defteri — dolum simülasyonu mümkün mü
+    const depth = poly ? (poly.up_book_depth_usd || 0) + (poly.down_book_depth_usd || 0) : 0;
+    cards.push({
+        label: 'Emir defteri',
+        sub: 'gerçek dolum için gerekli',
+        value: integrity.book_live ? `$${depth.toFixed(0)}` : 'YOK',
+        note: integrity.book_live ? 'derinlik toplamı' : 'dolum simüle edilemez',
+        state: integrity.book_live ? 'ok' : 'bad',
+    });
+
+    grid.innerHTML = cards.map(c => `
+        <div class="integrity-card ${c.state}">
+            <div class="ic-label">${c.label}</div>
+            <div class="ic-sub">${c.sub}</div>
+            <div class="ic-value monospace">${c.value}</div>
+            <div class="ic-note">${c.note}</div>
+        </div>
+    `).join('');
+}
+
+// ==================================================================== //
+//  BOT İŞLEM DEFTERİ                                                    //
+//  Bir bot seç -> o botun TÜM işlemleri, her alanıyla.                  //
+// ==================================================================== //
+let _ledgerBot = null;
+let _ledgerBotsLoaded = false;
+
+async function loadLedgerBots(strategies) {
+    const sel = document.getElementById('ledger-bot-select');
+    if (!sel || !strategies || !strategies.length) return;
+    if (_ledgerBotsLoaded) return;
+
+    sel.innerHTML = strategies.map(s =>
+        `<option value="${encodeURIComponent(s.name)}">${s.name}</option>`
+    ).join('');
+    _ledgerBot = strategies[0].name;
+    _ledgerBotsLoaded = true;
+
+    sel.addEventListener('change', () => {
+        _ledgerBot = decodeURIComponent(sel.value);
+        loadLedger();
+    });
+    document.getElementById('ledger-filter')
+        ?.addEventListener('change', () => renderLedger());
+    document.getElementById('ledger-refresh')
+        ?.addEventListener('click', () => loadLedger());
+
+    loadLedger();
+}
+
+let _ledgerData = null;
+
+async function loadLedger() {
+    if (!_ledgerBot) return;
+    try {
+        const res = await fetch(`/api/trades/${encodeURIComponent(_ledgerBot)}`);
+        if (!res.ok) return;
+        _ledgerData = await res.json();
+        renderLedger();
+    } catch (e) {
+        console.error('Ledger fetch failed', e);
+    }
+}
+
+function renderLedger() {
+    if (!_ledgerData) return;
+    const tbody = document.querySelector('#ledger-table tbody');
+    const sumEl = document.getElementById('ledger-summary');
+    const filter = document.getElementById('ledger-filter')?.value || 'all';
+    if (!tbody) return;
+
+    const s = _ledgerData.summary || {};
+    if (sumEl) {
+        const warn = [];
+        if (s.future_window_trades > 0)
+            warn.push(`<span class="lg-warn">⚠ ${s.future_window_trades} işlem İLERİ pencereye</span>`);
+        if (s.liquidity_capped_trades > 0)
+            warn.push(`<span class="lg-warn">⚠ ${s.liquidity_capped_trades} işlemde likidite bahsi kıstı</span>`);
+
+        sumEl.innerHTML = `
+            <span class="lg-stat">Toplam <b>${s.total ?? 0}</b></span>
+            <span class="lg-stat">Açık <b>${s.open ?? 0}</b></span>
+            <span class="lg-stat">K/Z <b class="positive">${s.wins ?? 0}</b>/<b class="negative">${s.losses ?? 0}</b></span>
+            <span class="lg-stat">İsabet <b>${s.win_rate != null ? s.win_rate + '%' : '—'}</b></span>
+            <span class="lg-stat">Bakiye <b class="monospace">$${(s.balance ?? 0).toFixed(2)}</b></span>
+            <span class="lg-stat">P&L <b class="monospace ${(s.total_pnl ?? 0) >= 0 ? 'positive' : 'negative'}">${(s.total_pnl ?? 0) >= 0 ? '+' : ''}$${(s.total_pnl ?? 0).toFixed(2)}</b></span>
+            <span class="lg-stat" title="Polymarket'in kote ettiği ortalama oran">Ort. piyasa oranı <b class="monospace">${s.avg_mid_price != null ? '$' + s.avg_mid_price.toFixed(4) : '—'}</b></span>
+            <span class="lg-stat" title="Defter yürütülerek gerçekte ödenen ortalama oran">Ort. ödenen <b class="monospace">${s.avg_entry_price != null ? '$' + s.avg_entry_price.toFixed(4) : '—'}</b></span>
+            <span class="lg-stat" title="Spread + defter kayması — Polymarket'te komisyon yok, gerçek maliyet budur">Ort. maliyet <b class="monospace ${(s.avg_total_cost_bps ?? 0) > 300 ? 'negative' : ''}">${s.avg_total_cost_bps != null ? s.avg_total_cost_bps.toFixed(0) + ' bps' : '—'}</b></span>
+            ${warn.join(' ')}
+        `;
+    }
+
+    let rows = _ledgerData.trades || [];
+    if (filter === 'open') rows = rows.filter(t => t.result == null);
+    else if (filter === 'WIN' || filter === 'LOSE') rows = rows.filter(t => t.result === filter);
+
+    if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="22" style="text-align:center;color:var(--text-muted);">Bu filtreye uyan işlem yok</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = rows.map(t => {
+        const pending = t.result == null;
+        const resCls = pending ? 'pending' : (t.result === 'WIN' ? 'win' : 'lose');
+        const resTxt = pending ? 'AÇIK' : (t.result === 'WIN' ? 'KAZANDI' : 'KAYBETTİ');
+        const pnlTxt = (typeof t.pnl === 'number')
+            ? `${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}` : '…';
+        const pnlCls = (typeof t.pnl === 'number')
+            ? (t.pnl >= 0 ? 'positive' : 'negative') : 'muted';
+
+        const winLabel = t.is_future_window
+            ? `<span class="lg-future" title="Bu işlem, açıldığı anda henüz başlamamış bir pencereye yapıldı">${t.window_label} ⏭+${t.window_offset}</span>`
+            : t.window_label;
+
+        const amtLabel = t.liquidity_capped
+            ? `<span class="lg-capped" title="Defter yetmedi: istenen $${t.requested_amount}">$${t.amount.toFixed(2)}⚠</span>`
+            : `$${t.amount.toFixed(2)}`;
+
+        // Piyasanın kote ettiği orana (midpoint) göre TOPLAM işlem maliyeti:
+        // spread (mid -> en iyi ask) + defter kayması (ask -> ortalama dolum).
+        // Kârı yiyen gerçek maliyet budur; Polymarket'te ayrıca komisyon yoktur.
+        const totalCostBps = (t.mid_price > 0)
+            ? (t.entry_price - t.mid_price) / t.mid_price * 10000
+            : null;
+
+        // Erken çıkış: pozisyonu pencere sonunu beklemeden bid'e sattık mı?
+        let exitTypeHtml, salvageHtml;
+        if (t.is_early_exit) {
+            exitTypeHtml = `<span class="lg-exit" title="${(t.exit_reason || '').replace(/"/g,'&quot;')}">ERKEN ${t.exit_at_str || ''}</span>`;
+            // Maliyetin yüzde kaçını geri aldık — "ne kurtarırsak kâr"
+            const pct = t.amount > 0 ? (t.exit_proceeds / t.amount * 100) : 0;
+            salvageHtml = `$${t.exit_proceeds.toFixed(2)}<span class="muted"> (%${pct.toFixed(0)})</span>`;
+        } else if (t.exit_blocked_reason) {
+            exitTypeHtml = `<span class="lg-warn" title="${t.exit_blocked_reason.replace(/"/g,'&quot;')}">ÇIKAMADI</span>`;
+            salvageHtml = '—';
+        } else if (t.result == null) {
+            exitTypeHtml = '<span class="muted">açık</span>';
+            salvageHtml = '—';
+        } else {
+            exitTypeHtml = '<span class="muted">çözüm</span>';
+            salvageHtml = '—';
+        }
+
+        return `<tr class="lg-row ${resCls}">
+            <td class="muted">${t.date_str}</td>
+            <td class="monospace">${t.time_str}</td>
+            <td class="monospace">${winLabel}</td>
+            <td><span class="side-${t.side}">${t.side}</span></td>
+            <td class="monospace" title="Polymarket'in o andaki kote ettiği oran (midpoint = zımni olasılık)">${t.mid_price ? '$' + t.mid_price.toFixed(4) : '—'}</td>
+            <td class="monospace" title="Defter yürütülerek GERÇEKTE ödenen ağırlıklı ortalama oran">$${t.entry_price.toFixed(4)}</td>
+            <td class="monospace muted">$${t.top_ask.toFixed(4)}</td>
+            <td class="monospace ${totalCostBps > 300 ? 'negative' : 'muted'}" title="Midpoint'e göre toplam işlem maliyeti (spread + defter kayması)">${totalCostBps != null ? totalCostBps.toFixed(0) + 'bps' : '—'}</td>
+            <td class="monospace">${t.shares.toFixed(1)}</td>
+            <td class="monospace">${amtLabel}</td>
+            <td class="monospace">${(t.calibrated_confidence * 100).toFixed(0)}%<span class="muted"> (ham ${(t.raw_confidence * 100).toFixed(0)}%)</span></td>
+            <td class="monospace ${t.ev >= 0 ? 'positive' : 'negative'}">${t.ev >= 0 ? '+' : ''}${t.ev.toFixed(3)}</td>
+            <td class="monospace muted">${t.btc_price_at_entry ? '$' + t.btc_price_at_entry.toLocaleString('en-US') : '—'}</td>
+            <td class="monospace">${t.chainlink_at_entry ? '$' + t.chainlink_at_entry.toLocaleString('en-US') : '—'}</td>
+            <td class="monospace muted">${t.cl_divergence_bps ? t.cl_divergence_bps.toFixed(1) + 'bps' : '—'}</td>
+            <td class="monospace muted">${t.resolve_at_str || '—'}</td>
+            <td>${exitTypeHtml}</td>
+            <td class="monospace">${t.is_early_exit ? '$' + t.exit_price.toFixed(4) + `<span class="muted"> (bid ${t.exit_top_bid.toFixed(2)})</span>` : '—'}</td>
+            <td class="monospace">${salvageHtml}</td>
+            <td><span class="result-${resCls}">${resTxt}</span>${t.outcome ? `<span class="muted"> (${t.outcome})</span>` : ''}</td>
+            <td class="monospace ${pnlCls}">${pnlTxt}</td>
+            <td class="lg-reason" title="${(t.reasoning || '').replace(/"/g, '&quot;')}">${t.reasoning || '—'}</td>
+        </tr>`;
+    }).join('');
+}
+
 // Initial fetch
 fetchData();
 
 // Poll every 3 seconds
 setInterval(fetchData, 3000);
+// İşlem defterini 10 saniyede bir tazele (daha ağır bir sorgu)
+setInterval(loadLedger, 10000);

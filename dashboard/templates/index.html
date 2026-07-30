@@ -35,6 +35,12 @@
             </div>
         </header>
 
+        <!-- VERİ BÜTÜNLÜĞÜ — hangi kaynak canlı, kaynaklar ayrışıyor mu -->
+        <section class="glass-panel integrity-panel" id="integrity-panel">
+            <h2>Veri Bütünlüğü <span class="muted micro-sub">— sistem gerçek veriyle mi çalışıyor?</span></h2>
+            <div class="integrity-grid" id="integrity-grid"></div>
+        </section>
+
         <!-- Mikroyapı göstergeleri (canlı piyasa sinyalleri) -->
         <section class="glass-panel micro-panel">
             <h2>Piyasa Mikroyapısı <span class="muted micro-sub">— 5dk yön tahmininde asıl bilgi taşıyan veriler</span></h2>
@@ -59,6 +65,55 @@
         <!-- Strategy Grid -->
         <section class="strategies-grid" id="strategies-grid">
             <!-- Strategy cards will be injected here by JS -->
+        </section>
+
+        <!-- BOT İŞLEM DEFTERİ — bot seç, tüm işlemlerini tam detayla gör -->
+        <section class="glass-panel ledger-panel">
+            <div class="ledger-head">
+                <h2>Bot İşlem Defteri <span class="muted micro-sub">— seçilen botun tüm işlemleri, tam detay</span></h2>
+                <div class="ledger-controls">
+                    <select id="ledger-bot-select" class="ledger-select"></select>
+                    <select id="ledger-filter" class="ledger-select">
+                        <option value="all">Tümü</option>
+                        <option value="open">Açık</option>
+                        <option value="WIN">Kazanan</option>
+                        <option value="LOSE">Kaybeden</option>
+                    </select>
+                    <button id="ledger-refresh" class="ledger-btn">Yenile</button>
+                </div>
+            </div>
+            <div class="ledger-summary" id="ledger-summary"></div>
+            <div class="table-container ledger-table-wrap">
+                <table id="ledger-table">
+                    <thead>
+                        <tr>
+                            <th>Tarih</th>
+                            <th>Saat</th>
+                            <th>Pencere (5dk)</th>
+                            <th>Yön</th>
+                            <th>Piyasa oranı</th>
+                            <th>Ödenen oran</th>
+                            <th>Top Ask</th>
+                            <th>Spread+kayma</th>
+                            <th>Hisse</th>
+                            <th>Bahis</th>
+                            <th>Güven</th>
+                            <th>EV</th>
+                            <th>BTC (Binance)</th>
+                            <th>Chainlink</th>
+                            <th>Fark</th>
+                            <th>Çözüm</th>
+                            <th>Çıkış tipi</th>
+                            <th>Çıkış oranı</th>
+                            <th>Kurtarılan</th>
+                            <th>Sonuç</th>
+                            <th>P&L</th>
+                            <th>Gerekçe</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
         </section>
 
         <!-- Lower Section (Leaderboard & Logs) -->
