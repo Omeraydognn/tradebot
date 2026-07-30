@@ -65,7 +65,17 @@ ADAPT_EVERY_N_TRADES = int(os.getenv("ADAPT_EVERY_N_TRADES", "3"))
 # bahis boyutunu/güveni etkiler. Amaç: her strateji her pencerede bir
 # pozisyon alsın, kazansın da kaybetsin de — kalibratör ve adaptasyon
 # gerçek veriyle beslensin.
-FORCE_TRADE_MODE = os.getenv("FORCE_TRADE_MODE", "true").lower() in ("1", "true", "yes")
+FORCE_TRADE_MODE = os.getenv("FORCE_TRADE_MODE", "false").lower() in ("1", "true", "yes")
+
+# --- Pencere doğruluğu ---
+# Polymarket'in ŞU ANKİ 5dk piyasası bulunamadığında kod bir SONRAKİ
+# pencereye düşebiliyor. O pencere henüz BAŞLAMAMIŞTIR: elimizdeki
+# mikroyapı (CVD, defter, momentum) o pencereye ait değildir, yani
+# sinyalimizin hiçbir öngörü değeri yoktur — kör bahis olur.
+# Varsayılan: kapalı. Açılırsa işlemler "İLERİ PENCERE" diye etiketlenir.
+ALLOW_FUTURE_WINDOW_TRADES = os.getenv(
+    "ALLOW_FUTURE_WINDOW_TRADES", "false"
+).lower() in ("1", "true", "yes")
 
 # Dashboard — Render/bulut $PORT verirse onu kullan, yoksa 5050
 DASHBOARD_PORT = int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT", "5050"))

@@ -124,6 +124,28 @@ Değişiklikler her parametrenin kendi `min/max` sınırı içinde kalır — g�
 
 `GEMINI_API_KEY` Render panelinden **gizli** env olarak girilmeli — repoya yazma.
 
+### 🔴 Kalıcılık — `DATABASE_URL` olmadan deploy etmeyin
+
+Render'ın dosya sistemi **ephemeral**'dır: her deploy'da ve free planda her
+uyku/uyanma çevriminde konteyner sıfırdan kurulur, çalışma anında yazılan
+`state.json` **silinir**. `DATABASE_URL` yoksa her deploy'da şunlar sıfırlanır:
+
+| Kaybolan | Sonucu |
+|---|---|
+| Tüm bakiyeler | $1000'a döner, P&L geçmişi yok olur |
+| İşlem geçmişi | Hangi botun ne yaptığı denetlenemez |
+| Kalibratör örnekleri | Güven kalibrasyonu baştan öğrenir |
+| Ajanların yazdığı tezler | AI'lar geliştirdiği stratejiyi kaybeder |
+| Online model ağırlıkları | `n_updates=0`, bootstrap baştan çalışır |
+
+`render.yaml` bu yüzden bir Postgres tanımlar ve `DATABASE_URL`'i otomatik
+bağlar; `persistence.py` bu değişken varsa durumu dosya yerine veritabanına
+yazar. Blueprint ile deploy edersen bu ayar kendiliğinden gelir.
+
+Dashboard'daki **Veri Bütünlüğü** panelinde ilk kart bunu gösterir:
+`Kalıcılık: Postgres · deploy'dan sağ çıkar` (yeşil) ya da
+`Kalıcılık: SADECE DOSYA · bulutta deploy'da SİLİNİR` (kırmızı).
+
 ---
 
 ## 🔍 Dürüstlük notu (önemli)

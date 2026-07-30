@@ -1,5 +1,28 @@
 # Render.com deploy yapılandırması
 # Bu dosyayı repoya push edip Render'da "New +" -> "Blueprint" ile bağla.
+#
+# ==================================================================== #
+#  KALICILIK — EN ÖNEMLİ KISIM                                          #
+#                                                                       #
+#  Render'ın dosya sistemi EPHEMERAL'dır: her deploy'da ve free planda   #
+#  her uyku/uyanma çevriminde konteyner sıfırdan kurulur. Çalışma anında #
+#  yazılan state.json SİLİNİR. Bu yüzden aşağıda bir Postgres tanımlı:   #
+#  durum oraya yazılır ve deploy'lardan bağımsız olarak yaşar.           #
+#                                                                       #
+#  Postgres OLMADAN her deploy'da şunlar sıfırlanır:                     #
+#    • tüm bakiyeler ($1000'a döner)   • tüm işlem geçmişi               #
+#    • güven kalibratörü örnekleri     • ajanların yazdığı tezler        #
+#    • online model ağırlıkları (n_updates=0, bootstrap baştan)          #
+#  Yani AI'lar geliştirdiği stratejiyi her deploy'da kaybeder.           #
+# ==================================================================== #
+databases:
+  - name: tradebot-state
+    databaseName: tradebot
+    user: tradebot
+    plan: free          # free Postgres'in süre sınırı vardır; kalıcı kullanım
+                        # için ücretli plana geçmen gerekir.
+    region: frankfurt   # web servisiyle AYNI bölge olmalı
+
 services:
   - type: web
     name: polymarket-ai-trading
@@ -13,3 +36,20 @@ services:
         sync: false     # Render panelinden GİZLİ olarak elle gir (repoya yazma!)
       - key: PYTHON_VERSION
         value: "3.12.6"
+      # Durumun yazılacağı kalıcı veritabanı — Render bunu otomatik doldurur.
+      # persistence.py DATABASE_URL varsa dosya yerine Postgres kullanır.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tradebot-state
+          property: connectionString
+
+    # ALTERNATİF: kalıcı DİSK. Render'da disk yalnızca ÜCRETLİ planlarda
+    # vardır ve servisi tek instance'a sabitler. Postgres free planda da
+    # çalıştığı için varsayılan o. Ücretli plana geçersen:
+    #
+    # plan: starter
+    # disk:
+    #   name: state
+    #   mountPath: /var/data
+    #   sizeGB: 1
+    # ve envVars'a: STATE_FILE = /var/data/state.json

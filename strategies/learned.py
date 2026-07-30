@@ -23,7 +23,7 @@ from typing import Optional
 from strategies.base import BaseStrategy, Signal
 from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
-from online_model import OnlineLogisticModel
+from online_model import OnlineLogisticModel, MIN_SAMPLES_TO_PREDICT
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,9 @@ class LearnedStrategy(BaseStrategy):
         self.model = model
         self.min_conviction = 0.03      # 0.50'den min sapma
         self.require_beats_random = 1.0  # 1=sadece model iyiyken işlem yap
+        # Neden sinyal üretmedi (arayüzde gösterilir — "bot dondu mu?" sorusunun cevabı)
+        self.silence_reason: Optional[str] = None
+        self.last_p_up: Optional[float] = None
 
     def get_tunables(self) -> dict:
         t = super().get_tunables()
@@ -50,16 +53,41 @@ class LearnedStrategy(BaseStrategy):
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
         micro = self.data.microstructure_snapshot()
         p_up = self.model.predict_proba(micro)
+
+        # SESSİZLİK TEŞHİSİ: bu strateji günlerce hiç işlem açmayabilir ve
+        # dışarıdan "bot dondu mu?" diye görünür. Neden sustuğunu her
+        # döngüde kaydediyoruz; arayüz bunu gösterir.
         if p_up is None:
-            return None   # yeterli veri yok — sessiz kal
+            if self.model.n_updates < MIN_SAMPLES_TO_PREDICT:
+                self.silence_reason = (
+                    f"model henüz öğreniyor ({self.model.n_updates}/"
+                    f"{MIN_SAMPLES_TO_PREDICT} pencere)"
+                )
+            else:
+                self.silence_reason = "mikroyapı verisi eksik (özellik çıkarılamadı)"
+            self.last_p_up = None
+            return None
+
+        self.last_p_up = p_up
 
         # Model henüz rastgeleden iyi değilse işlem açma (dürüstlük kuralı)
         if self.require_beats_random >= 0.5 and self.model.beats_random is False:
+            ll = self.model.log_loss
+            self.silence_reason = (
+                f"model rastgeleyi yenemiyor (log-loss {ll:.4f} ≥ 0.685) — "
+                f"dürüstlük kuralı işlemi durduruyor"
+            )
             return None
 
         conviction = abs(p_up - 0.50)
         if conviction < self.min_conviction:
+            self.silence_reason = (
+                f"kanaat zayıf (|{p_up:.3f}-0.50|={conviction:.3f} "
+                f"< {self.min_conviction:.3f})"
+            )
             return None
+
+        self.silence_reason = None
 
         direction = "UP" if p_up > 0.50 else "DOWN"
         confidence = p_up if direction == "UP" else (1.0 - p_up)

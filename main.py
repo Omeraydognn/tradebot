@@ -12,9 +12,14 @@ Starts:
 Usage:
   source venv/bin/activate && python main.py
 """
+import os
+import certifi
+os.environ["SSL_CERT_FILE"] = certifi.where()
+
 import asyncio
 import time
 import logging
+import signal
 import sys
 
 from polymarket import AsyncPublicClient, PRODUCTION
@@ -112,9 +117,20 @@ async def strategy_loop(agents: list[AIAgent], data: MarketDataService, paper: P
             except Exception as e:
                 logger.debug(f"AI initiate error: {e}")
 
+        # ERKEN ÇIKIŞ: açık pozisyonlar her döngüde gözden geçirilir.
+        # Kaybeden pozisyonda bid'e satıp ne kurtarılırsa kurtarılır;
+        # kazananda kâr kilitlenir. Resolution'dan ÖNCE çalışır.
+        early_closed = 0
+        for agent in agents:
+            try:
+                early_closed += agent.strategy.check_early_exits(snapshot)
+            except Exception as e:
+                logger.debug(f"Erken çıkış hatası ({agent.name}): {e}")
+
         # Resolution: her trade, penceresinin RESMİ (Chainlink tabanlı)
         # Polymarket çözümüyle kapatılır — Binance tahminiyle değil.
         resolved = await resolve_due_trades(data, paper, agents, online_model)
+        resolved += early_closed
 
         # İşlem sonuçlandıysa: ajanlar öğrenip stratejilerini adapte etsin
         if resolved:
@@ -207,8 +223,15 @@ async def train_online_model(data: MarketDataService, online_model) -> int:
     ONLINE MODEL EĞİTİMİ.
 
     Kapanmış her 5dk penceresi için:
-        girdi  = pencere BAŞINDA dondurulmuş mikroyapı (ileriye bakış yok)
+        girdi  = pencere İÇİNDE alınmış mikroyapı örnekleri (ileriye bakış yok)
         hedef  = piyasanın RESMİ sonucu (Chainlink tabanlı)
+
+    ÇOKLU ÖRNEK (train/serve uyumu):
+      Pencere boyunca ~30sn'de bir örnek alınır ve hepsi AYNI sonuçla
+      etiketlenir. Canlı strateji pencerenin ortasında tahmin istediği için
+      model de tam olarak o durumu görmelidir; sadece pencere başıyla
+      eğitmek modeli hiç karşılaşmayacağı bir dünyaya hazırlardı.
+      Yan fayda: pencere başına 1 yerine ~10 örnek -> 10x öğrenme hızı.
 
     Etiket kalitesi kritik: Binance kıyasıyla üretilen etiketlerin ~%8'i
     yanlıştı; model bozuk etiketle öğrenirse hiçbir zaman gerçek sinyali
@@ -221,8 +244,8 @@ async def train_online_model(data: MarketDataService, online_model) -> int:
     for w in sorted(list(data.window_micro.keys())):
         if w >= current_window:
             continue  # pencere henüz kapanmadı
-        micro = data.window_micro.get(w)
-        if not micro:
+        samples = data.window_micro.get(w)
+        if not samples:
             data.window_micro.pop(w, None)
             continue
 
@@ -235,8 +258,9 @@ async def train_online_model(data: MarketDataService, online_model) -> int:
         went_up = (outcome == "UP")
 
         data.record_window_outcome(went_up)
-        online_model.update(micro, went_up)
-        learned += 1
+        for micro in samples:
+            online_model.update(micro, went_up)
+            learned += 1
         data.window_micro.pop(w, None)       # tekrar öğrenmeyi önle
 
         if online_model.n_updates % 10 == 0:
@@ -309,16 +333,35 @@ async def main():
     await strategy_loop(agents, data_service, paper_trader, online_model)
 
 
+def _save_on_shutdown(why: str):
+    """
+    Kapanışta son durumu kaydeder.
+
+    NEDEN KRİTİK: Render (ve çoğu PaaS) deploy sırasında SIGTERM gönderir.
+    Eskiden yalnızca KeyboardInterrupt (SIGINT) yakalanıyordu; yani her
+    deploy'da son 30 saniyenin işlemleri ve AI öğrenmesi kaydedilmeden
+    yok oluyordu. Artık SIGTERM de yakalanıyor.
+    """
+    logger.info(f"👋 Kapatılıyor ({why}) — durum kaydediliyor…")
+    try:
+        from dashboard.app import _paper_trader, _agents, _online_model
+        if _paper_trader and _agents:
+            ok = save_state(_paper_trader, _agents, online_model=_online_model)
+            logger.info("💾 Durum kaydedildi." if ok else "⚠️  Durum KAYDEDİLEMEDİ!")
+    except Exception as e:
+        logger.error(f"Kapanışta kayıt hatası: {e}")
+
+
+def _handle_sigterm(signum, frame):
+    _save_on_shutdown(f"sinyal {signum}")
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    # Deploy/ölçekleme sırasında gelen SIGTERM'de de durumu kaydet
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("👋 Kapatılıyor — durum kaydediliyor…")
-        try:
-            from dashboard.app import _paper_trader, _agents
-            if _paper_trader and _agents:
-                save_state(_paper_trader, _agents)
-                logger.info("💾 Durum kaydedildi.")
-        except Exception as e:
-            logger.error(f"Kapanışta kayıt hatası: {e}")
+        _save_on_shutdown("Ctrl+C")
         sys.exit(0)
