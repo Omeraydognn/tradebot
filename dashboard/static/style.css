@@ -739,3 +739,25 @@ button.strat-status.active { color: var(--up-color); }
     border-radius: 4px;
     font-weight: 600;
 }
+
+/* Fiyat dilimi öğrenme tablosu (her işlemden öğrenilenler) */
+.bucket-table { margin-bottom: 10px; }
+.bucket-head { font-size: 0.74rem; font-weight: 600; margin-bottom: 6px; }
+.bucket-row-wrap {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+}
+.bucket-cell {
+    flex: 0 0 auto;
+    min-width: 96px;
+    padding: 7px 9px;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.04);
+    border-left: 3px solid rgba(255, 255, 255, 0.15);
+}
+.bk-range { font-size: 0.7rem; color: var(--text-muted); }
+.bk-wr    { font-size: 1.0rem; font-weight: 700; }
+.bk-n     { font-size: 0.64rem; }
+.bk-pnl   { font-size: 0.72rem; }

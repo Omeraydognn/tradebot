@@ -205,13 +205,18 @@ async def resolve_due_trades(data: MarketDataService, paper: PaperTrader,
             paper.resolve_trade(trade, outcome)
             resolved += 1
 
-            # KALİBRASYON: stratejinin HAM güveni gerçekle eşleşti mi?
+            # HER İŞLEMDEN ÖĞREN: kalibratör + fiyat dilimi tablosu
             agent = agent_by_strategy.get(trade.strategy_name)
-            if agent is not None and trade.raw_confidence > 0:
-                agent.strategy.calibrator.record(
-                    raw_conf=trade.raw_confidence,
-                    won=(trade.result == "WIN"),
-                )
+            if agent is not None:
+                if trade.raw_confidence > 0:
+                    agent.strategy.calibrator.record(
+                        raw_conf=trade.raw_confidence,
+                        won=(trade.result == "WIN"),
+                    )
+                try:
+                    agent.strategy.learn_from_trade(trade)
+                except Exception as e:
+                    logger.debug(f"learn_from_trade hatası: {e}")
 
             logger.info(f"🔔 [{trade.strategy_name}] sonuç: {outcome} | {source}")
 

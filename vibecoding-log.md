@@ -7,3 +7,4 @@
 - [Faz 3] domain: Pencere Hizası (şu anki vs ileri 5dk piyasası) | tech: Train/Serve Skew (eğitim-servis uyumsuzluğu)
 - [Faz 3] domain: Erken Çıkış / Kurtarma Değeri (bid'e satış) | tech: Simetrik Defter Simülasyonu (ask=al, bid=sat)
 - [Faz 3] domain: Pozisyondan Çıkamama Riski (dar defter) | tech: Ephemeral Filesystem & SIGTERM ile durum kaybı
+- [Faz 3] domain: Keşif-Sömürü Dengesi (her pencereye girip veri toplamak) | tech: Koşullu İstatistik (fiyat dilimi bazlı öğrenme)

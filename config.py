@@ -67,6 +67,33 @@ ADAPT_EVERY_N_TRADES = int(os.getenv("ADAPT_EVERY_N_TRADES", "3"))
 # gerçek veriyle beslensin.
 FORCE_TRADE_MODE = os.getenv("FORCE_TRADE_MODE", "false").lower() in ("1", "true", "yes")
 
+# --- HER PENCEREYE GİR (maksimum öğrenme modu) ---
+# Amaç: kalibratör ve adapt() yalnızca SONUÇLANMIŞ işlemlerden öğrenir.
+# İşlem az olursa öğrenme durur. Bu mod, fiyat bandı dahil tüm "iştah"
+# filtrelerini kaldırır; her bot her pencerede bir pozisyon alır.
+#
+# KALDIRILANLAR : EV eşiği, persona vetosu, fiyat bandı (PRICE_MIN/MAX)
+# KORUNANLAR    : pencere doğruluğu (ileri pencereye asla girilmez),
+#                 emir defteri gerçekliği (dolum simüle edilemiyorsa girilmez),
+#                 pencere başına tek pozisyon, pencere sonu kesme payı.
+#                 Bunlar "iştah" değil GERÇEKLİK kurallarıdır; kaldırılırsa
+#                 üretilen veri de sahte olur ve öğrenme anlamsızlaşır.
+ALWAYS_TRADE_MODE = os.getenv("ALWAYS_TRADE_MODE", "false").lower() in ("1", "true", "yes")
+
+# Bu modda bahis KÜÇÜK tutulur. Sebep matematiksel: $0.04'ten alınan pozisyon
+# %96 ihtimalle sıfırlanır. Normal bahisle birkaç saatte bakiye biter ve bot
+# hiç işlem yapamaz hale gelir — yani "çok veri" hedefinin tam tersi olur.
+# Küçük sabit bahis = binlerce sonuçlanmış işlem = gerçek öğrenme.
+ALWAYS_TRADE_BET = float(os.getenv("ALWAYS_TRADE_BET", "5.0"))
+
+# Bakiye bu seviyenin altına inerse bahis daha da küçülür (asla sıfırlanmasın,
+# öğrenme döngüsü hiç durmasın).
+ALWAYS_TRADE_MIN_BALANCE = float(os.getenv("ALWAYS_TRADE_MIN_BALANCE", "100.0"))
+
+# Bu modda pencere sonu kesme payı kısalır (daha çok pencere yakalanır),
+# ama sıfır olamaz — çözülmüş bir pencereye girmek veri değil gürültüdür.
+ALWAYS_TRADE_LAST_SECONDS = float(os.getenv("ALWAYS_TRADE_LAST_SECONDS", "30"))
+
 # --- Pencere doğruluğu ---
 # Polymarket'in ŞU ANKİ 5dk piyasası bulunamadığında kod bir SONRAKİ
 # pencereye düşebiliyor. O pencere henüz BAŞLAMAMIŞTIR: elimizdeki
