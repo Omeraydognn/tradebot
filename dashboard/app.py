@@ -149,7 +149,7 @@ def create_app(data_service, paper_trader, agents, online_model=None):
             "online_model": _online_model.to_dict() if _online_model else None,
             "strategies": strategies_data,
             "leaderboard": _paper_trader.get_leaderboard(),
-            "recent_trades": _paper_trader.get_trade_log(20),
+            "recent_trades": _paper_trader.get_trade_log(60),
         })
 
     @app.route("/api/trades/<path:name>")
@@ -163,6 +163,12 @@ def create_app(data_service, paper_trader, agents, online_model=None):
             return jsonify({"error": "Strateji bulunamadı", "name": name}), 404
 
         rows = portfolio.full_history()
+        # Bu botun her işlemden öğrendiği koşullu tablo
+        buckets = []
+        for a in _agents:
+            if a.strategy.name == name:
+                buckets = a.strategy.price_bucket_table()
+                break
         wins = [t for t in rows if t["result"] == "WIN"]
         losses = [t for t in rows if t["result"] == "LOSE"]
         closed = wins + losses
@@ -170,6 +176,7 @@ def create_app(data_service, paper_trader, agents, online_model=None):
         return jsonify({
             "name": name,
             "trades": rows,
+            "price_buckets": buckets,
             "summary": {
                 "total": len(rows),
                 "open": sum(1 for t in rows if t["result"] is None),

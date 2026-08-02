@@ -183,7 +183,7 @@ class StrategyPortfolio:
             "losses": self.losses,
             "win_rate": round(self.win_rate, 1),
             "max_drawdown": round(self.max_drawdown, 1),
-            "last_10_trades": [t.to_dict() for t in self.trades[-10:]],
+            "last_10_trades": [t.to_dict() for t in self.trades[-25:]],
             "open_trades": [t.to_dict() for t in self.pending_trades],
             "balance_history": self.balance_history[-60:],  # P&L grafiği
             # Gerçeklik göstergeleri — arayüzde uyarı olarak gösterilir

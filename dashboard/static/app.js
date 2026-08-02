@@ -715,9 +715,47 @@ function renderLedger() {
         `;
     }
 
+    // HER İŞLEMDEN ÖĞRENİLEN TABLO — hangi fiyat diliminde gerçekten
+    // kazanıyoruz? Uçtaki fiyatlardan da işlem açılan modda bu ayrım şart:
+    // $0.05'ten alınan yüzlerce işlem $0.50'dekilerin istatistiğini bozmasın.
+    const bEl = document.getElementById('ledger-buckets');
+    if (bEl) {
+        const bs = _ledgerData.price_buckets || [];
+        if (!bs.length) {
+            bEl.innerHTML = '';
+        } else {
+            bEl.innerHTML = `
+                <div class="bucket-head">Giriş fiyatı dilimine göre öğrenilenler
+                    <span class="muted">— her sonuçlanan işlem buraya yazılır</span></div>
+                <div class="bucket-row-wrap">
+                ${bs.map(b => {
+                    const wr = b.win_rate;
+                    const cls = wr == null ? '' : (wr >= 50 ? 'positive' : 'negative');
+                    const pcls = b.pnl >= 0 ? 'positive' : 'negative';
+                    return `<div class="bucket-cell" title="${b.n} işlem, toplam P&L $${b.pnl}">
+                        <div class="bk-range monospace">$${b.bucket}</div>
+                        <div class="bk-wr monospace ${cls}">${wr != null ? wr.toFixed(0) + '%' : '—'}</div>
+                        <div class="bk-n muted">${b.n} işlem</div>
+                        <div class="bk-pnl monospace ${pcls}">${b.pnl >= 0 ? '+' : ''}$${b.pnl.toFixed(2)}</div>
+                    </div>`;
+                }).join('')}
+                </div>`;
+        }
+    }
+
     let rows = _ledgerData.trades || [];
+    const totalAll = rows.length;
     if (filter === 'open') rows = rows.filter(t => t.result == null);
     else if (filter === 'WIN' || filter === 'LOSE') rows = rows.filter(t => t.result === filter);
+
+    // Kaç satırın çizildiğini açıkça yaz — "hepsi mi görünüyor?" sorusu
+    // tahmine kalmasın.
+    const cntEl = document.getElementById('ledger-count');
+    if (cntEl) {
+        cntEl.textContent = (filter === 'all')
+            ? `${totalAll} işlemin tamamı gösteriliyor`
+            : `${rows.length} / ${totalAll} işlem (filtre: ${filter})`;
+    }
 
     if (!rows.length) {
         tbody.innerHTML = '<tr><td colspan="22" style="text-align:center;color:var(--text-muted);">Bu filtreye uyan işlem yok</td></tr>';

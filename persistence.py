@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 SAVE_INTERVAL_SEC = float(os.getenv("SAVE_INTERVAL_SEC", "30"))
 
+# Kaç işlem saklansın. "Her pencereye gir" modunda bot başına günde ~288,
+# 7 botla ~2000 işlem üretilir; 200'lük eski tavan bir günü bile tutmuyordu
+# ve arayüzde geçmiş "birkaç tane" görünüyordu.
+MAX_SAVED_TRADES = int(os.getenv("MAX_SAVED_TRADES", "5000"))
+
 # ==================================================================== #
 #  DEPOLAMA KATMANI — DEPLOY'DAN SAĞ ÇIKMAK İÇİN                       #
 #                                                                       #
@@ -237,7 +242,7 @@ def save_state(paper_trader, agents, path: str = STATE_FILE, online_model=None) 
                 "total_pnl": p.total_pnl,
                 "peak_balance": p.peak_balance,
                 "max_drawdown": p.max_drawdown,
-                "trades": [_trade_to_row(t) for t in p.trades[-200:]],
+                "trades": [_trade_to_row(t) for t in p.trades[-MAX_SAVED_TRADES:]],
                 "pending_trades": [_trade_to_row(t) for t in p.pending_trades],
                 "balance_history": p.balance_history[-200:],
             }
@@ -262,6 +267,9 @@ def save_state(paper_trader, agents, path: str = STATE_FILE, online_model=None) 
                 "reflections": getattr(a, "reflections", [])[-10:],
                 "ai_initiated": getattr(a, "ai_initiated", 0),
                 "trades_at_last_reflect": getattr(a, "_trades_at_last_reflect", 0),
+                # Her işlemden öğrenilen koşullu tablo — kaybolmamalı
+                "price_bucket_stats": getattr(a.strategy, "price_bucket_stats", {}),
+                "early_exits": getattr(a.strategy, "early_exits", 0),
             }
 
         state = {
@@ -335,7 +343,7 @@ def load_state(paper_trader, agents, path: str = STATE_FILE, online_model=None) 
             p.pending_trades = [_row_to_trade(r) for r in (pd_.get("pending_trades") or [])]
             p.balance_history = [tuple(x) for x in (pd_.get("balance_history") or [])]
             # Global log'u da doldur ki dashboard boş görünmesin
-            paper_trader.global_trade_log.extend(p.trades[-20:])
+            paper_trader.global_trade_log.extend(p.trades[-100:])
 
         # Ajanlar (öğrenilmiş parametreler)
         for a in agents:
@@ -361,6 +369,8 @@ def load_state(paper_trader, agents, path: str = STATE_FILE, online_model=None) 
             a.reflections = ad.get("reflections") or []
             a.ai_initiated = ad.get("ai_initiated", 0)
             a._trades_at_last_reflect = ad.get("trades_at_last_reflect", 0)
+            a.strategy.price_bucket_stats = ad.get("price_bucket_stats") or {}
+            a.strategy.early_exits = ad.get("early_exits", 0)
 
         # Online model (öğrenilmiş ağırlıklar)
         if online_model is not None and state.get("online_model"):

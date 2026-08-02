@@ -20,8 +20,12 @@ from market_data import MarketDataService, PolymarketSnapshot
 from paper_trader import PaperTrader
 from config import (
     GEMINI_API_KEY, GEMINI_MODEL, AI_MIN_INTERVAL_SEC, ADAPT_EVERY_N_TRADES,
-    FORCE_TRADE_MODE,
+    FORCE_TRADE_MODE, ALWAYS_TRADE_MODE,
 )
+
+# "Her pencereye gir" modu, zorunlu modu da kapsar: persona vetosu ve EV
+# eşiği işlemi durduramaz. Tek fark: bu mod fiyat bandını da kaldırır.
+_FORCED = FORCE_TRADE_MODE or ALWAYS_TRADE_MODE
 from personas import get_persona, local_persona_judgment
 from ai_budget import BUDGET
 
@@ -103,7 +107,7 @@ class AIAgent:
         )
 
         if delta is None:
-            if not FORCE_TRADE_MODE:
+            if not _FORCED:
                 # Kişilik işlemi reddetti
                 self.ai_overrides += 1
                 self.strategy.last_skip_reason = f"{self.persona['title']}: {reason}"
@@ -278,7 +282,7 @@ SADECE JSON döndür:
         burada da aynen geçerlidir — sadece "hiç bakmama" durumunu ortadan
         kaldırır.
         """
-        if not FORCE_TRADE_MODE or not self.strategy.is_active:
+        if not _FORCED or not self.strategy.is_active:
             return None
         if self.strategy.has_position_in_window(snapshot.window_start):
             return None

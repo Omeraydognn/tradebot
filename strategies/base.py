@@ -17,6 +17,8 @@ from paper_trader import PaperTrader
 from config import (
     POLYMARKET_FEE_RATE, PRICE_MIN, PRICE_MAX, NO_TRADE_LAST_SECONDS,
     FORCE_TRADE_MODE, ALLOW_FUTURE_WINDOW_TRADES,
+    ALWAYS_TRADE_MODE, ALWAYS_TRADE_BET, ALWAYS_TRADE_MIN_BALANCE,
+    ALWAYS_TRADE_LAST_SECONDS,
 )
 from calibration import Calibrator
 
@@ -81,6 +83,15 @@ class BaseStrategy(ABC):
         self.early_exits: int = 0
         self.exit_blocked_count: int = 0
 
+        # --- HER İŞLEMDEN ÖĞRENME ---
+        # Kalibratör tek bir "güven -> isabet" eğrisi öğrenir. Bu tablo ise
+        # KOŞULA göre öğrenir: "hangi giriş fiyatı diliminde gerçekten
+        # kazanıyorum?". Uçtaki fiyatlardan da işlem açılan modda bu ayrım
+        # kritik — $0.05'ten alınan işlemlerle $0.50'den alınanlar aynı
+        # dünyada değildir ve tek bir ortalama ikisini de gizler.
+        # {dilim: {"n": adet, "wins": adet, "pnl": toplam}}
+        self.price_bucket_stats: dict = {}
+
     @abstractmethod
     def generate_signal(self, snapshot: PolymarketSnapshot) -> Optional[Signal]:
         """
@@ -110,12 +121,23 @@ class BaseStrategy(ABC):
                                   "desc": "bid girişin bu katına çıkarsa kârı kilitle"},
         }
 
+    # "Her pencereye gir" modunda AI'ın DOKUNAMAYACAĞI parametreler.
+    #
+    # Gözlenen sorun: az işlem -> zarar -> adapt() eşikleri sıkar -> daha az
+    # işlem. Ölüm sarmalı. Canlıda AI `min_ev`'i izin verilen tavana (0.15)
+    # ve `min_conviction`'ı 0.03'ten 0.14'e çekmişti; sistem neredeyse hiç
+    # işlem açmaz olmuştu. Bu modun amacı veri toplamak olduğu için
+    # seçiciliği artıran parametreler kilitlenir.
+    _SELECTIVITY_KEYS = ("min_ev", "min_conviction")
+
     def set_tunables(self, values: dict):
         """Verilen parametreleri güvenli sınırlar içinde uygular."""
         spec = self.get_tunables()
         for key, val in (values or {}).items():
             if key not in spec:
                 continue
+            if ALWAYS_TRADE_MODE and key in self._SELECTIVITY_KEYS:
+                continue  # bu modda seçicilik artırılamaz
             try:
                 v = float(val["value"] if isinstance(val, dict) else val)
             except (TypeError, ValueError):
@@ -297,17 +319,55 @@ class BaseStrategy(ABC):
         #    o pencere henüz başlamamıştır: mikroyapı verimiz o pencereye ait
         #    değildir, yani sinyalimizin hiçbir geçerliliği yoktur.
         time_left = (snapshot.window_end - time.time()) if snapshot.window_end else 999.0
-        price_ok = PRICE_MIN <= share_price <= PRICE_MAX
-        time_ok = time_left >= NO_TRADE_LAST_SECONDS
+        cutoff = ALWAYS_TRADE_LAST_SECONDS if ALWAYS_TRADE_MODE else NO_TRADE_LAST_SECONDS
+        # HER PENCEREYE GİR modunda fiyat bandı uygulanmaz (uçtaki fiyatlardan
+        # da işlem açılır) — amaç maksimum sonuçlanmış işlem, yani maksimum
+        # kalibrasyon verisi.
+        price_ok = ALWAYS_TRADE_MODE or (PRICE_MIN <= share_price <= PRICE_MAX)
+        time_ok = time_left >= cutoff
         window_free = not self.has_position_in_window(snapshot.window_start)
         window_current = (snapshot.window_offset == 0) and snapshot.is_current_window
         window_ok = window_current or ALLOW_FUTURE_WINDOW_TRADES
 
-        # Kelly ile bahis boyutu (edge büyüdükçe artar)
-        bet = self.kelly_bet_size(signal.confidence, share_price) if self.kelly_fraction > 0 else self.bet_size
-        if bet <= 0:
-            bet = self.bet_size
-        bet = round(max(10.0, bet), 2)
+        if ALWAYS_TRADE_MODE:
+            # KÜÇÜK ama ÖĞRENMEYE DUYARLI bahis.
+            #
+            # Sabit bahis, öğrenmeyi kısırlaştırır: kalibratör ve adapt()
+            # veriden bir avantaj çıkarsa bile onu kâra çevirecek hiçbir kol
+            # kalmaz (bet_size/kelly yok sayılırdı). O yüzden taban bahis
+            # küçük tutulur ama KANITLANMIŞ avantajla ölçeklenir.
+            #
+            # Ölçek = kalibre edilmiş güven ile piyasa fiyatı arasındaki fark
+            # (Kelly'nin özü). Avantaj yoksa taban bahsin yarısı, güçlü ve
+            # KANITLANMIŞ avantaj varsa en fazla 3 katı oynanır. Böylece
+            # hem her pencereye girilir hem de öğrenmenin bir karşılığı olur.
+            portfolio = self.paper.portfolios.get(self.name)
+            balance = portfolio.balance if portfolio else 0.0
+
+            edge = signal.confidence - share_price      # pozitif = avantaj
+            # Kalibratör kanıt biriktirdikçe avantaja daha çok itibar edilir
+            n_cal = len(self.calibrator.samples)
+            trust = min(1.0, n_cal / 40.0)
+            mult = 1.0 + (edge / max(0.05, 1.0 - share_price)) * 2.0 * trust
+            mult = max(0.5, min(3.0, mult))
+
+            # adapt()'ın öğrendiği bet_size da etkili olsun (yoksa AI ölü bir
+            # parametreyi ayarlar). Varsayılana ORANLA uygulanır ve dar bir
+            # banda kısılır: AI risk iştahını değiştirebilsin ama bu modun
+            # "küçük bahis, uzun ömür" ilkesini bozamasın.
+            size_ratio = max(0.5, min(2.0, self.bet_size / 50.0))
+
+            bet = ALWAYS_TRADE_BET * mult * size_ratio
+            if balance < ALWAYS_TRADE_MIN_BALANCE:
+                bet = max(1.0, balance * 0.02)   # kalanın %2'si — asla bitmesin
+            bet = round(min(bet, max(1.0, balance)), 2)
+            decision["bet_multiplier"] = round(mult, 2)
+        else:
+            # Kelly ile bahis boyutu (edge büyüdükçe artar)
+            bet = self.kelly_bet_size(signal.confidence, share_price) if self.kelly_fraction > 0 else self.bet_size
+            if bet <= 0:
+                bet = self.bet_size
+            bet = round(max(10.0, bet), 2)
 
         # GERÇEK DOLUM: emir defterini seviye seviye yürüterek gerçekten
         # ödenecek ortalama fiyatı ve alınabilecek hisse adedini bul.
@@ -328,7 +388,7 @@ class BaseStrategy(ABC):
         # Zorunlu modda EV eşiği işlemi ENGELLEMEZ — sadece gerçek koruma
         # bantları (fiyat aralığı, pencere sonu, tek pozisyon, pencere
         # doğruluğu) geçerlidir. Bunlar gerçeklikle ilgilidir, iştahla değil.
-        ev_ok = FORCE_TRADE_MODE or (ev > self.min_ev)
+        ev_ok = FORCE_TRADE_MODE or ALWAYS_TRADE_MODE or (ev > self.min_ev)
 
         if ev_ok and price_ok and time_ok and window_free and window_ok and fill_ok:
             cl = self.data.chainlink
@@ -383,6 +443,49 @@ class BaseStrategy(ABC):
             self.ai_decisions.pop(0)
 
         return decision
+
+    @staticmethod
+    def _price_bucket(price: float) -> str:
+        """Giriş fiyatını 0.10'luk dilimlere ayırır: '0.00-0.10', '0.50-0.60'…"""
+        p = max(0.0, min(0.999, float(price)))
+        lo = int(p * 10) / 10.0
+        return f"{lo:.2f}-{lo + 0.10:.2f}"
+
+    def learn_from_trade(self, trade) -> dict:
+        """
+        SONUÇLANAN HER İŞLEMDEN ÖĞREN.
+
+        Kalibratörden farkı: kalibratör "%60 dediğimde %60 tutuyor muyum?"
+        sorusunu tek eğriyle cevaplar. Bu tablo koşullu öğrenir — hangi
+        FİYAT DİLİMİNDE gerçekten para kazanıldığını ayrı ayrı biriktirir.
+
+        Uçtaki fiyatlardan da işlem açılan modda bu şart: $0.05'ten alınan
+        yüzlerce işlem, $0.50'den alınanların istatistiğini bozmamalı.
+
+        Dönüş: bu işlemin dilimine ait güncel özet (arayüz için).
+        """
+        b = self._price_bucket(trade.entry_price)
+        st = self.price_bucket_stats.setdefault(b, {"n": 0, "wins": 0, "pnl": 0.0})
+        st["n"] += 1
+        if trade.result == "WIN":
+            st["wins"] += 1
+        st["pnl"] += float(trade.pnl or 0.0)
+        return {"bucket": b, **st}
+
+    def price_bucket_table(self) -> list:
+        """Fiyat dilimi bazında öğrenilen tablo (arayüzde gösterilir)."""
+        rows = []
+        for b, st in sorted(self.price_bucket_stats.items()):
+            n = st["n"]
+            rows.append({
+                "bucket": b,
+                "n": n,
+                "wins": st["wins"],
+                "win_rate": round(st["wins"] / n * 100, 1) if n else None,
+                "pnl": round(st["pnl"], 2),
+                "avg_pnl": round(st["pnl"] / n, 3) if n else None,
+            })
+        return rows
 
     def check_early_exits(self, snapshot: PolymarketSnapshot) -> int:
         """
@@ -440,6 +543,12 @@ class BaseStrategy(ABC):
             if self.paper.close_trade_early(trade, sell, reason):
                 self.early_exits += 1
                 closed += 1
+                # Erken çıkan işlem de bir derstir (kalibratöre gitmez —
+                # yön doğru muydu bilmiyoruz — ama fiyat dilimi tablosuna girer)
+                try:
+                    self.learn_from_trade(trade)
+                except Exception as e:
+                    logger.debug(f"learn_from_trade (erken çıkış) hatası: {e}")
             else:
                 # Çıkamadık — dar defterde sıkıştık. Bu gerçek bir risktir.
                 self.exit_blocked_count += 1
@@ -470,6 +579,8 @@ class BaseStrategy(ABC):
             "last_skip_reason": self.last_skip_reason,
             "early_exits": self.early_exits,
             "exit_blocked_count": self.exit_blocked_count,
+            # Her işlemden öğrenilen koşullu tablo
+            "price_buckets": self.price_bucket_table(),
             "stop_loss_ratio": round(self.stop_loss_ratio, 3),
             "take_profit_ratio": round(self.take_profit_ratio, 3),
             "calibration": self.calibrator.to_dict(),
