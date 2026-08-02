@@ -16,6 +16,9 @@ import websockets
 from polymarket import AsyncPublicClient, PRODUCTION
 
 from chainlink_feed import ChainlinkPriceFeed
+from config import (
+    NO_TRADE_LAST_SECONDS, ALWAYS_TRADE_MODE, ALWAYS_TRADE_LAST_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -793,6 +796,29 @@ class MarketDataService:
             return False
 
         w = int(now) - (int(now) % 300)
+
+        # SADECE İŞLEM AÇABİLECEĞİMİZ ANLARDAN ÖRNEK AL.
+        #
+        # NEDEN (ölçülmüş hata): pencere boyunca ayrım gözetmeden örnek
+        # alınınca modelin isabeti %74'e, log-loss'u 0.49'a çıkmıştı —
+        # ama bu sahte bir başarıydı. Pencerenin son saniyelerindeki
+        # örneklerde `cl_window_change` zaten sonucu söyler ("fiyat 4.5
+        # dakikadır yukarıda ve pencere kapanıyor"). Model bu kolay
+        # örneklerden öğrenip yüksek güven kazanıyor, ama biz o anda
+        # işlem AÇAMIYORUZ (pencere sonu koruma bandı).
+        #
+        # Doğrusal model "pencere sonundaysam bu sinyale güven, başındaysam
+        # güvenme" ayrımını yapamaz (etkileşim terimi yok); tek ağırlık
+        # öğrenir ve o ağırlık kolay örneklerin baskısı altında kalır.
+        # Sonuç: erken pencerede aşırı güven, yani zarar.
+        #
+        # Çözüm: eğitim dağılımı = servis dağılımı. Yalnızca gerçekten
+        # pozisyon açabildiğimiz zaman aralığından örnek alıyoruz.
+        time_left = (w + 300) - now
+        cutoff = ALWAYS_TRADE_LAST_SECONDS if ALWAYS_TRADE_MODE else NO_TRADE_LAST_SECONDS
+        if time_left < cutoff:
+            return False
+
         samples = self.window_micro.setdefault(w, [])
         if len(samples) >= 12:      # pencere başına üst sınır (bellek)
             return False

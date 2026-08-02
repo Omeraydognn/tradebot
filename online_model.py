@@ -58,6 +58,16 @@ FEATURE_SPEC = [
 
 MIN_SAMPLES_TO_PREDICT = 25   # bu kadar sonuç görmeden tahmin vermez
 
+# EĞİTİM SÜRÜMÜ — özellik seti veya örnekleme yöntemi değiştiğinde artırılır.
+# Kayıtlı model bu sürümle uyuşmuyorsa ağırlıklar SIFIRLANIR.
+#
+# Neden gerekli: v1'de pencere boyunca ayrım gözetmeden örnek alınıyordu ve
+# pencere sonundaki "cevabı bilen" örnekler modele %74 gibi sahte bir isabet
+# kazandırmıştı. Örnekleme düzeltildi ama kirlenmiş ağırlıklar kalıcı
+# depoda yaşamaya devam ederdi. Sürüm damgası bunu otomatik temizler —
+# yoksa yanlış modele güvenerek gerçek para riske edilirdi.
+TRAIN_VERSION = 2
+
 
 class OnlineLogisticModel:
     """Mikroyapı özelliklerinden P(UP) öğrenen artımlı lojistik regresyon."""
@@ -208,6 +218,8 @@ class OnlineLogisticModel:
 
     def dump(self) -> dict:
         return {
+            "train_version": TRAIN_VERSION,
+            "n_features": len(FEATURE_SPEC),
             "w": self.w,
             "bias": self.bias,
             "n_updates": self.n_updates,
@@ -215,7 +227,25 @@ class OnlineLogisticModel:
         }
 
     def load(self, d: dict):
+        """
+        Kayıtlı modeli yükler.
+
+        Eğitim sürümü veya özellik sayısı uyuşmuyorsa ağırlıklar YÜKLENMEZ —
+        model sıfırdan başlar. Eski/kirlenmiş ağırlıklarla devam etmek,
+        yanlış bir modele güvenmek demektir; sıfırdan öğrenmek yeğdir.
+        """
         try:
+            saved_ver = int(d.get("train_version", 1))
+            saved_n = int(d.get("n_features", len(d.get("w") or [])))
+
+            if saved_ver != TRAIN_VERSION or saved_n != len(FEATURE_SPEC):
+                logger.warning(
+                    f"♻️  Kayıtlı model uyumsuz "
+                    f"(sürüm {saved_ver}→{TRAIN_VERSION}, özellik {saved_n}→{len(FEATURE_SPEC)}) "
+                    f"— ağırlıklar SIFIRLANDI, model yeniden öğrenecek."
+                )
+                return
+
             w = d.get("w") or []
             if len(w) == len(self.w):
                 self.w = [float(x) for x in w]

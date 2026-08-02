@@ -121,12 +121,23 @@ class BaseStrategy(ABC):
                                   "desc": "bid girişin bu katına çıkarsa kârı kilitle"},
         }
 
+    # "Her pencereye gir" modunda AI'ın DOKUNAMAYACAĞI parametreler.
+    #
+    # Gözlenen sorun: az işlem -> zarar -> adapt() eşikleri sıkar -> daha az
+    # işlem. Ölüm sarmalı. Canlıda AI `min_ev`'i izin verilen tavana (0.15)
+    # ve `min_conviction`'ı 0.03'ten 0.14'e çekmişti; sistem neredeyse hiç
+    # işlem açmaz olmuştu. Bu modun amacı veri toplamak olduğu için
+    # seçiciliği artıran parametreler kilitlenir.
+    _SELECTIVITY_KEYS = ("min_ev", "min_conviction")
+
     def set_tunables(self, values: dict):
         """Verilen parametreleri güvenli sınırlar içinde uygular."""
         spec = self.get_tunables()
         for key, val in (values or {}).items():
             if key not in spec:
                 continue
+            if ALWAYS_TRADE_MODE and key in self._SELECTIVITY_KEYS:
+                continue  # bu modda seçicilik artırılamaz
             try:
                 v = float(val["value"] if isinstance(val, dict) else val)
             except (TypeError, ValueError):
@@ -319,14 +330,38 @@ class BaseStrategy(ABC):
         window_ok = window_current or ALLOW_FUTURE_WINDOW_TRADES
 
         if ALWAYS_TRADE_MODE:
-            # Sabit KÜÇÜK bahis: bakiyenin uzun süre dayanması ve öğrenme
-            # döngüsünün hiç durmaması için. Bakiye azaldıkça bahis de küçülür.
+            # KÜÇÜK ama ÖĞRENMEYE DUYARLI bahis.
+            #
+            # Sabit bahis, öğrenmeyi kısırlaştırır: kalibratör ve adapt()
+            # veriden bir avantaj çıkarsa bile onu kâra çevirecek hiçbir kol
+            # kalmaz (bet_size/kelly yok sayılırdı). O yüzden taban bahis
+            # küçük tutulur ama KANITLANMIŞ avantajla ölçeklenir.
+            #
+            # Ölçek = kalibre edilmiş güven ile piyasa fiyatı arasındaki fark
+            # (Kelly'nin özü). Avantaj yoksa taban bahsin yarısı, güçlü ve
+            # KANITLANMIŞ avantaj varsa en fazla 3 katı oynanır. Böylece
+            # hem her pencereye girilir hem de öğrenmenin bir karşılığı olur.
             portfolio = self.paper.portfolios.get(self.name)
             balance = portfolio.balance if portfolio else 0.0
-            bet = ALWAYS_TRADE_BET
+
+            edge = signal.confidence - share_price      # pozitif = avantaj
+            # Kalibratör kanıt biriktirdikçe avantaja daha çok itibar edilir
+            n_cal = len(self.calibrator.samples)
+            trust = min(1.0, n_cal / 40.0)
+            mult = 1.0 + (edge / max(0.05, 1.0 - share_price)) * 2.0 * trust
+            mult = max(0.5, min(3.0, mult))
+
+            # adapt()'ın öğrendiği bet_size da etkili olsun (yoksa AI ölü bir
+            # parametreyi ayarlar). Varsayılana ORANLA uygulanır ve dar bir
+            # banda kısılır: AI risk iştahını değiştirebilsin ama bu modun
+            # "küçük bahis, uzun ömür" ilkesini bozamasın.
+            size_ratio = max(0.5, min(2.0, self.bet_size / 50.0))
+
+            bet = ALWAYS_TRADE_BET * mult * size_ratio
             if balance < ALWAYS_TRADE_MIN_BALANCE:
                 bet = max(1.0, balance * 0.02)   # kalanın %2'si — asla bitmesin
             bet = round(min(bet, max(1.0, balance)), 2)
+            decision["bet_multiplier"] = round(mult, 2)
         else:
             # Kelly ile bahis boyutu (edge büyüdükçe artar)
             bet = self.kelly_bet_size(signal.confidence, share_price) if self.kelly_fraction > 0 else self.bet_size
